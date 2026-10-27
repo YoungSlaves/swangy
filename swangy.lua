@@ -1,6 +1,3 @@
--- swangy
--- esp: generators, windows, pallets
--- skillcheck: generators and the butcher trap
 -- menu: swangy ui by aphalia (github.com/YoungSlaves/matchaUI)
 
 if _G.__SWANGY and _G.__SWANGY.unload then pcall(_G.__SWANGY.unload) end
@@ -19,19 +16,19 @@ local CFG = {
     palHz     = 8,
 
     gen       = true,
-    genRange  = 500,
+    genRange  = 1000,
     genPool   = 16,
     genText   = 13,
     genState  = true,
     genFill   = true,
     genFillA  = 0.25,
     genThick  = 1.6,
-    genIdleColour   = Color3.fromRGB(26, 255, 51),
+    genIdleColour   = Color3.fromRGB(255, 150, 40),
     genDoneColour   = Color3.fromRGB(51, 255, 77),
     genBrokenColour = Color3.fromRGB(255, 120, 120),
 
     win       = true,
-    winRange  = 500,
+    winRange  = 1000,
     winPool   = 24,
     winText   = 12,
     winFill   = true,
@@ -40,17 +37,17 @@ local CFG = {
     winColour = Color3.fromRGB(255, 230, 0),
 
     pal       = true,
-    palRange  = 240,
+    palRange  = 1000,
     palPool   = 20,
     palText   = 12,
     palFill   = true,
     palFillA  = 0.20,
     palThick  = 1.6,
-    palColour     = Color3.fromRGB(255, 26, 26),
+    palColour     = Color3.fromRGB(139, 90, 50),
     palDownColour = Color3.fromRGB(255, 140, 26),
 
     names     = true,
-    espRange  = 500,
+    espRange  = 1000,
 
     sc        = true,
     scLead    = 2,
@@ -2184,7 +2181,10 @@ local function keyToVk(k)
     end
     return nil
 end
-local function vkName(vk) return VK_NAME[vk] or tostring(vk) end
+local function vkName(vk)
+    if vk == nil or vk == 0 then return "None" end
+    return VK_NAME[vk] or tostring(vk)
+end
 
 local capturing
 local focusedInput
@@ -2465,10 +2465,10 @@ function KeyPicker:GetHeight() return 21 end
 function KeyPicker:GetState() return self.state end
 function KeyPicker:SetValue(v)
     if type(v) == "table" then
-        local vk = keyToVk(v[1]); if vk then self.vk = vk end
+        self.vk = keyToVk(v[1])
         if v[2] then self.mode = v[2] end
     else
-        local vk = keyToVk(v); if vk then self.vk = vk end
+        self.vk = keyToVk(v)
     end
     self.state = false
     self:Fire(self)
@@ -2476,6 +2476,12 @@ function KeyPicker:SetValue(v)
 end
 function KeyPicker:Capture(code)
     capturing = nil
+    if code == VK.Escape then
+        self.vk = nil
+        self.state = false
+        if self.changedCallback then pcall(self.changedCallback, self) end
+        return
+    end
     self.vk = code
     self.state = false
     if self.changedCallback then pcall(self.changedCallback, self) end
@@ -2491,15 +2497,15 @@ function KeyPicker:NotifyState(on)
     end
 end
 function KeyPicker:Evaluate()
-    if capturing == self or not self.vk then return end
+    if capturing == self then return end
     if self.mode == "Always" then
         if not self.state then
             self.state = true
             self:Fire(self)
-            self:NotifyState(true)
         end
         return
     end
+    if not self.vk then return end
     local down = keyDown(self.vk)
     if self.mode == "Hold" then
         if down ~= self.state then
@@ -2831,7 +2837,7 @@ end
 local function attachKeyPicker(parent, id, cfg)
     cfg = cfg or {}
     local el = newElement(KeyPicker, id, cfg.Text or id)
-    el.vk = keyToVk(cfg.Default or "F") or VK.F
+    el.vk = keyToVk(cfg.Default)
     el.mode = cfg.Mode or "Toggle"
     el.state = false
     el.changedCallback = cfg.ChangedCallback
@@ -3351,7 +3357,7 @@ end
 function Groupbox:AddKeyPicker(id, cfg)
     cfg = cfg or {}
     local el = newElement(KeyPicker, id, cfg.Text or id)
-    el.vk = keyToVk(cfg.Default or "F") or VK.F
+    el.vk = keyToVk(cfg.Default)
     el.mode = cfg.Mode or "Toggle"
     el.state = false
     el.changedCallback = cfg.ChangedCallback
@@ -4906,7 +4912,7 @@ local function buildUI()
             end
         end,
     })
-    scToggle:AddKeyPicker("sc_enabled_key", { Default = "Insert", Mode = "Toggle" })
+    scToggle:AddKeyPicker("sc_enabled_key", { Text = "Toggle key", Mode = "Always" })
 
     scGroup:AddToggle("sc_humanize", {
         Text = "Humanize (random delay)",
