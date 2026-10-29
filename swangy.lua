@@ -1,3 +1,8 @@
+-- swangy
+-- esp: generators, windows, pallets, bear traps
+-- skillcheck: generators and the butcher trap
+-- aimbot: veil spear throw assist
+-- hud: killer timers, generator column, survivor list
 -- menu: swangy ui by aphalia (github.com/YoungSlaves/matchaUI)
 
 if _G.__SWANGY and _G.__SWANGY.unload then pcall(_G.__SWANGY.unload) end
@@ -46,6 +51,16 @@ local CFG = {
     palColour     = Color3.fromRGB(139, 90, 50),
     palDownColour = Color3.fromRGB(255, 140, 26),
 
+    trap          = true,
+    trapRange     = 1000,
+    trapPool      = 12,
+    trapText      = 12,
+    trapFill      = true,
+    trapFillA     = 0.20,
+    trapThick     = 1.6,
+    trapArmedColour  = Color3.fromRGB(80, 255, 120),
+    trapSprungColour = Color3.fromRGB(255, 60, 60),
+
     names     = true,
     espRange  = 1000,
 
@@ -62,9 +77,32 @@ local CFG = {
     scDry     = false,
     scMode    = nil,
 
+    va        = false,
+    vaFov     = 55,
+    vaRange   = 260,
+    vaSmooth  = 1,
+    vaSticky  = true,
+    vaLead    = true,
+    vaLos     = true,
+    vaHold    = true,
+    vaAimHeight = 0,
+
+    kbw       = true,
+
+    hud          = true,
+    hudAlpha     = 0,
+    hudAbilities = true,
+    hudPerks     = true,
+    hudGens      = true,
+    hudSurvivors = true,
+    hudTraps     = true,
+    hudState     = false,
+
 }
 
 local UI, uiWindow
+local kbwDestroy
+local HUD = {}
 
 local COL = {
     genIdle  = Color3.fromRGB(26, 255, 51),
@@ -499,7 +537,10 @@ local function updateGenStates(list)
         if t and t.model then
             local okp, prog = pcall(function() return t.model:GetAttribute("RepairProgress") end)
             local okc, crew = pcall(function() return t.model:GetAttribute("PlayersRepairingCount") end)
-            if okp and type(prog) == "number" then t.prog = prog end
+            if okp and type(prog) == "number" then
+                t.prog = prog
+                if HUD.genRate then HUD.genRate(t, prog, now) end
+            end
             if okc and type(crew) == "number" then t.crew = crew end
             if now >= (t.stateAt or 0) then
                 t.stateAt = now + 1.5
@@ -877,6 +918,226 @@ local function drawPallets(camPos)
     end
     palShown = last
     return last
+end
+
+local trapPool, trapList = {}, {}
+local trapShown = 0
+for i = 1, CFG.trapPool do trapPool[i] = newSlot(CFG.trapThick, CFG.trapText) end
+
+-- bear traps
+local trapIndex, trapTrapped, trapVictimAt = {}, {}, 0
+
+local TRAP_VICTIM_ATTRS = {
+    "TrappedPlayer", "TrappedUser", "PlayerName", "Player", "Occupant", "User", "Caught",
+}
+
+local function trapArmed(inst)
+    local ok, v = pcall(function() return inst:GetAttribute("Armed") end)
+    if ok and type(v) == "boolean" then return v end
+end
+
+local function trapAddress(inst)
+    local ok, a = pcall(function() return inst.Address end)
+    return (ok and type(a) == "number" and a ~= 0) and a or nil
+end
+
+local function trapMeasure(inst)
+    local mnX, mnY, mnZ = math.huge, math.huge, math.huge
+    local mxX, mxY, mxZ = -math.huge, -math.huge, -math.huge
+    local rot, any = nil, false
+
+    local function note(part)
+        local okp, p = pcall(function() return part.Position end)
+        local oks, s = pcall(function() return part.Size end)
+        if not okp or not oks or not p or not s then return end
+        local hx, hy, hz = s.X * 0.5, s.Y * 0.5, s.Z * 0.5
+        if hx <= 0 or hy <= 0 or hz <= 0 or hx > 8 or hy > 8 or hz > 8 then return end
+        if p.X - hx < mnX then mnX = p.X - hx end
+        if p.X + hx > mxX then mxX = p.X + hx end
+        if p.Y - hy < mnY then mnY = p.Y - hy end
+        if p.Y + hy > mxY then mxY = p.Y + hy end
+        if p.Z - hz < mnZ then mnZ = p.Z - hz end
+        if p.Z + hz > mxZ then mxZ = p.Z + hz end
+        any = true
+        if not rot then rot = part end
+    end
+
+    if isPart(inst) then note(inst) end
+    local ok, desc = pcall(function() return inst:GetDescendants() end)
+    if ok and type(desc) == "table" then
+        for _, part in ipairs(desc) do
+            if part ~= inst and isPart(part) then note(part) end
+        end
+    end
+    if not any then return nil end
+
+    local center = Vector3.new((mnX + mxX) * 0.5, (mnY + mxY) * 0.5, (mnZ + mxZ) * 0.5)
+    local hx, hy, hz = (mxX - mnX) * 0.5, (mxY - mnY) * 0.5, (mxZ - mnZ) * 0.5
+    if hx < 0.05 or hy < 0.02 or hz < 0.05 then return nil end
+
+    local right, up, back = R_AXIS, U_AXIS, B_AXIS
+    if rot then
+        local okc, cf = pcall(function() return rot.CFrame end)
+        if okc and cf then right, up, back = basisFromCFrame(cf) end
+    end
+    return center, hx, hy, hz, right, up, back
+end
+
+local function trapRoots(map)
+    local out = {}
+    for _, ch in ipairs(map:GetChildren()) do
+        local n = lower(ch.Name)
+        if n == "beartrap" or n == "beartraps" then out[#out + 1] = ch end
+    end
+    if #out == 0 then
+        local ok, found = pcall(function() return map:FindFirstChild("BearTrap", true) end)
+        if ok and found then out[1] = found end
+    end
+    return out
+end
+
+local function collectTraps()
+    local map = Workspace:FindFirstChild("Map")
+    if not map then trapIndex = {} return {} end
+
+    local out, nextIndex, now = {}, {}, os.clock()
+
+    local function add(inst, armed)
+        local id = trapAddress(inst)
+        local entry = id and trapIndex[id] or nil
+        if not entry then
+            local center, hx, hy, hz, right, up, back = trapMeasure(inst)
+            if not center then return end
+            entry = { pos = center, hx = hx, hy = hy, hz = hz,
+                      right = right, up = up, back = back }
+        end
+        entry.id, entry.model = id, inst
+        if entry.armed ~= armed then
+            entry.armed = armed
+            if armed == false then
+                entry.sprungAt = now
+                if not entry.probed then
+                    entry.probed = true
+                    for i = 1, #TRAP_VICTIM_ATTRS do
+                        local ok, v = pcall(function() return inst:GetAttribute(TRAP_VICTIM_ATTRS[i]) end)
+                        if ok and type(v) == "string" and v ~= "" then
+                            entry.attrVictim = v
+                            break
+                        end
+                    end
+                end
+            end
+        end
+        if id then nextIndex[id] = entry end
+        out[#out + 1] = entry
+    end
+
+    local function walk(inst, depth)
+        if not inst or depth > 3 then return end
+        local armed = trapArmed(inst)
+        if armed ~= nil then
+            add(inst, armed)
+            return
+        end
+        local ok, kids = pcall(function() return inst:GetChildren() end)
+        if not ok or type(kids) ~= "table" then return end
+        for _, k in ipairs(kids) do walk(k, depth + 1) end
+    end
+
+    local roots = trapRoots(map)
+    for _, r in ipairs(roots) do walk(r, 0) end
+    trapIndex = nextIndex
+    return out
+end
+
+local function trapScanTrapped(now)
+    if now - trapVictimAt < 1.5 then return end
+    trapVictimAt = now
+    local out = {}
+    local ok, list = pcall(function() return Players:GetPlayers() end)
+    if not ok or type(list) ~= "table" then trapTrapped = out return end
+    local myId
+    pcall(function() myId = lp.UserId end)
+    for _, plr in ipairs(list) do
+        local char
+        pcall(function() char = plr.Character end)
+        if char then
+            local okT, trapped = pcall(function() return char:GetAttribute("Trapped") end)
+            if okT and trapped == true then
+                local root
+                pcall(function() root = char:FindFirstChild("HumanoidRootPart") end)
+                local okp, pos = false, nil
+                if root then okp, pos = pcall(function() return root.Position end) end
+                if okp and pos then
+                    out[#out + 1] = {
+                        name = tostring(plr.Name), pos = pos,
+                        self = (myId ~= nil and plr.UserId == myId),
+                    }
+                end
+            end
+        end
+    end
+    trapTrapped = out
+end
+
+local function trapVictim(t)
+    if t.attrVictim then return t.attrVictim end
+    local best, bestD2
+    for i = 1, #trapTrapped do
+        local v = trapTrapped[i]
+        local dx, dy, dz = v.pos.X - t.pos.X, v.pos.Y - t.pos.Y, v.pos.Z - t.pos.Z
+        local d2 = dx * dx + dy * dy + dz * dz
+        if d2 <= 225 and (not bestD2 or d2 < bestD2) then best, bestD2 = v, d2 end
+    end
+    if not best then return nil end
+    return best.self and "you" or best.name
+end
+
+local function trapLabel(t, dist)
+    local text = string.format("bear trap %dm", dist)
+    if t.armed == false then
+        local who = trapVictim(t)
+        text = text .. "  " .. (who and (who .. " trapped") or "trapped")
+    end
+    return text
+end
+
+local function drawTraps(camPos)
+    local n = 0
+    for i = 1, #trapList do
+        if n >= #trapPool then break end
+        local t = trapList[i]
+        local d = (t.pos - camPos).Magnitude
+        if d <= CFG.trapRange then
+            n = n + 1
+            local e = trapPool[n]
+            local colour = (t.armed == false) and CFG.trapSprungColour or CFG.trapArmedColour
+            local topY = drawBox(e, t.pos, t.hx, t.hy, t.hz,
+                t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
+                colour, CFG.trapFill and CFG.trapFillA or nil, CFG.trapThick)
+            local top, okTop = WorldToScreen(t.pos + Vector3.new(0, t.hy + 1.2, 0))
+            if okTop and top and CFG.names then
+                local text = string.format("BEAR TRAP  %dm", math.floor(d + 0.5))
+                if t.armed == false then
+                    text = text .. "  " .. (trapVictim(t) or "TRAPPED")
+                end
+                if e.lastTop ~= text then e.lastTop = text; e.top.Text = text end
+                if e.col ~= colour then e.col = colour; e.top.Color = colour end
+                e.top.Position = Vector2.new(top.X,
+                    (topY and topY < 100000) and (topY - 16) or (top.Y - 16))
+                e.top.Visible = true
+            elseif e.top.Visible then
+                e.top.Visible = false
+            end
+        else
+            hideSlot(e)
+        end
+    end
+    if trapShown > n then
+        for i = n + 1, trapShown do hideSlot(trapPool[i]) end
+    end
+    trapShown = n
+    return n
 end
 
 -- skillcheck
@@ -1433,7 +1694,7 @@ local function refreshWorld()
         winScanStamp = nil
     end
 
-    if not CFG.gen then
+    if not (CFG.gen or (CFG.hud and CFG.hudGens)) then
         genList = {}
     elseif genList[1] and stamp == genDiscoverStamp and os.clock() < genDiscoverAt then
 
@@ -1530,6 +1791,13 @@ connection = RunService.RenderStepped:Connect(function()
         for i = 1, palShown do hideSlot(palPool[i]) end
         palShown = 0
     end
+    if CFG.trap then
+        local okt, errt = pcall(drawTraps, camPos)
+        CFG.errTrap = (not okt) and tostring(errt) or nil
+    elseif trapShown > 0 then
+        for i = 1, trapShown do hideSlot(trapPool[i]) end
+        trapShown = 0
+    end
 
     renderMs = renderMs * 0.9 + (os.clock() - now) * 1000 * 0.1
 end)
@@ -1544,7 +1812,7 @@ end)
 local genPollHz = 15
 task.spawn(function()
     while running do
-        if CFG.gen and genList[1] then pcall(updateGenStates, genList) end
+        if (CFG.gen or (CFG.hud and CFG.hudGens)) and genList[1] then pcall(updateGenStates, genList) end
         task.wait(1 / genPollHz)
     end
 end)
@@ -1553,6 +1821,19 @@ task.spawn(function()
     while running do
         if os.clock() >= scBusyUntil then pcall(refreshPallets) end
         task.wait(1 / CFG.palHz)
+    end
+end)
+
+task.spawn(function()
+    while running do
+        if CFG.trap or (CFG.hud and CFG.hudTraps) then
+            local ok, list = pcall(collectTraps)
+            if ok and list then trapList = list end
+            pcall(trapScanTrapped, os.clock())
+        elseif #trapList > 0 then
+            trapList = {}
+        end
+        task.wait(1)
     end
 end)
 
@@ -1600,6 +1881,24 @@ end
 function API.pal.Toggle() return API.pal.SetEnabled(not CFG.pal) end
 function API.pal.SetRange(v) CFG.palRange = math.max(1, tonumber(v) or CFG.palRange) end
 function API.pal.GetCount() return #palList end
+
+API.trap = {}
+function API.trap.SetEnabled(on)
+    CFG.trap = on and true or false
+    if not CFG.trap then trapShown = 0 end
+    return CFG.trap
+end
+function API.trap.Toggle() return API.trap.SetEnabled(not CFG.trap) end
+function API.trap.SetRange(v) CFG.trapRange = math.max(1, tonumber(v) or CFG.trapRange) end
+function API.trap.GetCount() return #trapList end
+function API.trap.GetStates()
+    local out = {}
+    for i = 1, #trapList do
+        local t = trapList[i]
+        out[i] = { armed = t.armed, victim = trapVictim(t), pos = t.pos }
+    end
+    return out
+end
 function API.pal.GetStates()
     local out = {}
     for i = 1, #palList do out[i] = { dropped = palList[i].dropped, pos = palList[i].pos } end
@@ -1636,13 +1935,19 @@ end
 
 function API.GetConfig()
     return {
-        gen = CFG.gen, win = CFG.win, pal = CFG.pal, names = CFG.names,
+        gen = CFG.gen, win = CFG.win, pal = CFG.pal, trap = CFG.trap, names = CFG.names,
         range = CFG.genRange,
         winColour = CFG.winColour, palColour = CFG.palColour,
+        trapArmedColour = CFG.trapArmedColour, trapSprungColour = CFG.trapSprungColour,
         genIdleColour = CFG.genIdleColour, genDoneColour = CFG.genDoneColour,
         genBrokenColour = CFG.genBrokenColour,
         sc = CFG.sc, hum = CFG.scHum, humMin = CFG.scHumMin, humMax = CFG.scHumMax,
         react = CFG.scReact, delay = CFG.scDelay,
+        va = CFG.va, vaFov = CFG.vaFov, vaRange = CFG.vaRange, vaSmooth = CFG.vaSmooth,
+        vaSticky = CFG.vaSticky, vaLead = CFG.vaLead, vaLos = CFG.vaLos, vaHold = CFG.vaHold,
+        vaAimHeight = CFG.vaAimHeight, kbw = CFG.kbw,
+        hud = CFG.hud, hudAlpha = CFG.hudAlpha, hudGens = CFG.hudGens,
+        hudTraps = CFG.hudTraps, hudSurvivors = CFG.hudSurvivors,
         ui = UI ~= nil,
     }
 end
@@ -1658,15 +1963,21 @@ function API.Perf()
         gen      = #genList,
         win      = #winList,
         pal      = #palList,
+        trap     = #trapList,
+        hud      = HUD.count,
+        hudDrawMs = HUD.drawMs,
+        hudPollMs = HUD.pollMs,
         scHz     = CFG.scHz,
         frameMs  = math.floor(1 / math.max(drawFps, 1) * 1000 + 0.5),
-        err      = CFG.errGen or CFG.errWin or CFG.errPal,
+        err      = CFG.errGen or CFG.errWin or CFG.errPal or CFG.errTrap,
     }
 end
 
 function API.unload()
     if not running then return end
     running = false
+    if kbwDestroy then pcall(kbwDestroy) end
+    if HUD.destroy then pcall(HUD.destroy) end
     scReleaseInput()
     if UI and UI.Unload then pcall(function() UI:Unload() end) end
     UI, uiWindow = nil, nil
@@ -1674,10 +1985,1649 @@ function API.unload()
     for i = 1, #genPool do removeSlot(genPool[i]) end
     for i = 1, #winPool do removeSlot(winPool[i]) end
     for i = 1, #palPool do removeSlot(palPool[i]) end
-    genPool, winPool, palPool = {}, {}, {}
+    for i = 1, #trapPool do removeSlot(trapPool[i]) end
+    genPool, winPool, palPool, trapPool = {}, {}, {}, {}
     if _G.__SWANGY == API then _G.__SWANGY = nil end
 end
 API.stop = API.unload
+
+-- aimbot
+local vaStat = {
+    target = nil, dist = nil, speed = nil, flight = nil, hold = 0,
+    solved = false, tier = nil, charging = false, addr = false,
+    losOK = nil, error = nil, held = false, state = "Disabled",
+}
+
+local vaRot, vaRotFor, vaWarmAt = nil, nil, 0
+
+local function vaRotAddr()
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local base = cam.Address
+    if not base then return nil end
+    if vaRotFor == base and vaRot then return vaRot end
+
+    local now = os.clock()
+    if now < vaWarmAt then return nil end
+    vaWarmAt = now + 0.1
+
+    local ok, res = pcall(function()
+        local cf = cam.CFrame
+        if not cf then return nil end
+        local lv, pos = cf.LookVector, cf.Position
+        local function near(a, b, tol) return a and math.abs(a - b) <= tol end
+        local cand = { 0xD8 }
+        for o = 0x40, 0x400, 4 do cand[#cand + 1] = o end
+        for _, o in ipairs(cand) do
+            if near(rdf(base + o + 8), -lv.X, 0.01)
+                and near(rdf(base + o + 20), -lv.Y, 0.01)
+                and near(rdf(base + o + 32), -lv.Z, 0.01)
+                and near(rdf(base + o + 36), pos.X, 0.05)
+                and near(rdf(base + o + 40), pos.Y, 0.05)
+                and near(rdf(base + o + 44), pos.Z, 0.05) then
+                return o
+            end
+        end
+        return nil
+    end)
+    if ok and res then
+        vaRot, vaRotFor = base + res, base
+        return vaRot
+    end
+end
+
+local VA_UP = Vector3.new(0, 1, 0)
+
+local function vaWriteLook(addr, f)
+    if not addr or not f then return false end
+    local zv = -f
+    local xv = VA_UP:Cross(zv)
+    if xv.Magnitude < 1e-4 then return false end
+    xv = xv.Unit
+    local yv = zv:Cross(xv)
+    local ok = pcall(function()
+        memory_write("float", addr, xv.X)
+        memory_write("float", addr + 4, yv.X)
+        memory_write("float", addr + 8, zv.X)
+        memory_write("float", addr + 12, xv.Y)
+        memory_write("float", addr + 16, yv.Y)
+        memory_write("float", addr + 20, zv.Y)
+        memory_write("float", addr + 24, xv.Z)
+        memory_write("float", addr + 28, yv.Z)
+        memory_write("float", addr + 32, zv.Z)
+    end)
+    return ok
+end
+
+local VA_DT = 1 / 60
+local VA_MIN_HP = 25
+
+local function vaAngle(ox, oy, oz, px, py, pz, s, g)
+    local dx, dy, dz = px - ox, py - oy, pz - oz
+    local flat = math.sqrt(dx * dx + dz * dz)
+    if flat < 1e-3 then return nil end
+    local s2 = s * s
+    local disc = s2 * s2 - g * (g * flat * flat + 2 * dy * s2)
+    if disc < 0 then return nil end
+    local tan = (s2 - math.sqrt(disc)) / (g * flat)
+    local ang = math.atan(tan)
+    local ca, sa = math.cos(ang), math.sin(ang)
+    if ca < 1e-4 then return nil end
+    return Vector3.new(dx / flat * ca, sa, dz / flat * ca), flat / (s * ca)
+end
+
+local function vaIntercept(o, tp, tv, s, g)
+    local dir, ft = vaAngle(o.X, o.Y, o.Z, tp.X, tp.Y, tp.Z, s, g)
+    if not dir then return nil end
+    if tv then
+        for _ = 1, 6 do
+            local d2, f2 = vaAngle(o.X, o.Y, o.Z,
+                tp.X + tv.X * ft, tp.Y + tv.Y * ft, tp.Z + tv.Z * ft, s, g)
+            if not d2 then break end
+            local done = math.abs(f2 - ft) < 0.002
+            dir, ft = d2, f2
+            if done then break end
+        end
+    end
+    return dir, ft
+end
+
+local function vaSpeedFor(hold)
+    local charge = math.max(hold, 0.3)
+    return math.clamp(charge * 180, 1, 180), charge >= 1 and "FULL" or "PARTIAL"
+end
+
+local function vaLaunchIntercept(camera, tp, tv, speed)
+    local dir, ft = vaIntercept(camera, tp, tv, speed, 98.1)
+    if not dir then return nil end
+    for _ = 1, 8 do
+        local origin = camera + dir * 3
+        local nextDir, nextTime = vaIntercept(origin, tp, tv, speed, 98.1)
+        if not nextDir then return nil end
+        local delta = (nextDir - dir).Magnitude
+        dir, ft = nextDir, nextTime
+        if delta < 0.00001 then break end
+    end
+    local hit = camera + dir * (3 + speed * ft) + Vector3.new(0, -49.05 * ft * ft, 0)
+    local target = tv and tp + tv * ft or tp
+    if (hit - target).Magnitude > 0.25 then return nil end
+    return dir, ft
+end
+
+local vaHist = {}
+
+local function vaTrack(key, pos, now)
+    local h = vaHist[key]
+    if not h or now - h.t > 0.3 or (pos - h.p).Magnitude > 30 then
+        vaHist[key] = { p = pos, t = now, v = Vector3.new(0, 0, 0) }
+        return Vector3.new(0, 0, 0)
+    end
+    local dt = now - h.t
+    if dt >= 0.02 then
+        local inst = (pos - h.p) / dt
+        if inst.Magnitude > 60 then inst = inst.Unit * 60 end
+        h.v = h.v + (inst - h.v) * 0.35
+        h.p, h.t = pos, now
+    end
+    return h.v
+end
+
+local vaRP
+pcall(function()
+    local p = RaycastParams.new()
+    p.FilterType = Enum.RaycastFilterType.Exclude
+    vaRP = p
+end)
+
+local vaRayCap = nil
+local function vaRayUsable(myChar)
+    if vaRayCap ~= nil then return vaRayCap end
+    local hrp = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not hrp then return true end
+    local ok, hit = pcall(function()
+        local from = hrp.CFrame.Position + Vector3.new(0, 6, 0)
+        return Workspace:Raycast(from, Vector3.new(0, -12, 0))
+    end)
+    vaRayCap = (ok and hit ~= nil) and true or false
+    vaStat.losOK = vaRayCap
+    return vaRayCap
+end
+
+local function vaLineOfSight(o, p, myChar, theirChar)
+    if not vaRP or not vaRayUsable(myChar) then return true end
+    local d = p - o
+    if d.Magnitude < 1 then return true end
+    local ok, hit = pcall(function()
+        vaRP.FilterDescendantsInstances = { myChar, theirChar }
+        return Workspace:Raycast(o, d, vaRP)
+    end)
+    if not ok then return true end
+    return hit == nil
+end
+
+local function vaPlayers()
+    local ok, list = pcall(function() return Players:GetPlayers() end)
+    if ok and type(list) == "table" and #list > 0 then return list end
+    local ok2, kids = pcall(function() return Players:GetChildren() end)
+    if not ok2 or type(kids) ~= "table" then return {} end
+    local out = {}
+    for _, p in ipairs(kids) do
+        if p.ClassName == "Player" then out[#out + 1] = p end
+    end
+    return out
+end
+
+API.va = {}
+function API.va.SetEnabled(on)
+    CFG.va = on and true or false
+    if not CFG.va then
+        vaStat.target, vaStat.solved, vaStat.state = nil, false, "Disabled"
+    end
+    return CFG.va
+end
+function API.va.Toggle() return API.va.SetEnabled(not CFG.va) end
+function API.va.SetFov(v) CFG.vaFov = math.clamp(tonumber(v) or CFG.vaFov, 5, 180) end
+function API.va.SetRange(v) CFG.vaRange = math.clamp(tonumber(v) or CFG.vaRange, 20, 600) end
+function API.va.SetSmoothing(v) CFG.vaSmooth = math.clamp(tonumber(v) or CFG.vaSmooth, 1, 20) end
+function API.va.Stats() return vaStat end
+
+task.spawn(function()
+    local gateAt, isKiller, spearmode, myName = 0, false, false, nil
+    local myChar = nil
+    local pressT, wasDown, releaseArmed = nil, false, false
+    local releaseUntil, releaseHold = 0, 0
+    local lastT, lockName = nil, nil
+
+    while running do
+        local now = os.clock()
+        local dt = (lastT and (now - lastT)) or VA_DT
+        lastT = now
+        if dt <= 0 then dt = VA_DT elseif dt > 0.25 then dt = 0.25 end
+
+        if now >= gateAt then
+            gateAt = now + 0.1
+            local okg = pcall(function()
+                myChar = lp.Character
+                myName = lp.Name
+                local team = lp.Team
+                isKiller = (team and team.Name == "Killer") and true or false
+                spearmode = myChar and myChar:GetAttribute("spearmode") == true
+                if myChar then vaRayUsable(myChar) end
+            end)
+            if not okg then isKiller, spearmode = false, false end
+        end
+
+        local focused = false
+        pcall(function() focused = isrbxactive() == true end)
+        local menuOpen = uiWindow ~= nil and uiWindow.visible == true
+
+        local down = false
+        if not menuOpen and isKiller and spearmode and focused then
+            local okm, v = pcall(ismouse1pressed)
+            down = okm and v == true
+        end
+        if down and not wasDown then
+            pressT, releaseArmed, releaseUntil = now, true, 0
+        elseif (not down) and wasDown and releaseArmed then
+            local held = pressT and (now - pressT) or 0
+            releaseHold = math.max(held, 0.3)
+            releaseUntil = now + math.max(0, 0.3 - held) + 0.01 + 1 / 60
+            pressT, releaseArmed = nil, false
+        end
+        wasDown = down
+        local releasing = now < releaseUntil
+        local hold = pressT and (now - pressT) or (releasing and releaseHold or 0)
+        vaStat.hold = hold
+        vaStat.charging = pressT ~= nil or releasing
+
+        local armed = CFG.va and isKiller and (spearmode or releasing) and unsafeOn()
+            and not menuOpen and focused
+        if armed and CFG.vaHold and not vaStat.charging then armed = false end
+
+        if not CFG.va then vaStat.state = "Disabled"
+        elseif not unsafeOn() then vaStat.state = "Enable Unsafe LuaU"
+        elseif not isKiller then vaStat.state = "Killer only"
+        elseif not spearmode and not releasing then vaStat.state = "Equip a spear"
+        elseif not focused then vaStat.state = "Waiting for game focus"
+        elseif menuOpen then vaStat.state = "Menu open"
+        elseif CFG.vaHold and not vaStat.charging then vaStat.state = "Hold attack to charge"
+        end
+
+        if not armed then
+            vaStat.target, vaStat.solved, vaStat.dist = nil, false, nil
+            vaStat.speed, vaStat.flight, vaStat.tier = nil, nil, nil
+            lockName, vaStat.held = nil, false
+        else
+            local addr = vaRotAddr()
+            vaStat.addr = addr ~= nil
+            local cam = Workspace.CurrentCamera
+            local hrp = myChar and myChar:FindFirstChild("HumanoidRootPart")
+            if addr and cam and hrp then
+                local okAim, aimError = pcall(function()
+                    local look = cam.CFrame.LookVector
+                    local origin = cam.CFrame.Position
+                    local speed, tier = vaSpeedFor(hold)
+                    local cosFov = math.cos(math.rad(CFG.vaFov))
+
+                    local best, bestSol, bestFt, bestDist
+                    local heldSol, heldFt, heldDist
+                    for _, pl in ipairs(vaPlayers()) do
+                        if pl.Name ~= myName then
+                            local tm = pl.Team
+                            if tm and tm.Name == "Survivors" then
+                                local ch = pl.Character
+                                local thr = ch and ch:FindFirstChild("HumanoidRootPart")
+                                local hum = ch and ch:FindFirstChild("Humanoid")
+                                local hp = hum and hum.Health
+                                if thr and (type(hp) ~= "number" or hp >= VA_MIN_HP) then
+                                    local tp = thr.Position + Vector3.new(0, CFG.vaAimHeight or 0, 0)
+                                    local off = tp - origin
+                                    local dist = off.Magnitude
+                                    if dist > 1 and dist <= CFG.vaRange then
+                                        local isHeld = CFG.vaSticky and lockName == pl.Name
+                                        local dot = off.Unit:Dot(look)
+                                        if dot >= cosFov
+                                            and ((not best or dist < bestDist) or isHeld) then
+                                            local tv = CFG.vaLead and vaTrack(pl.Name, thr.Position, now) or nil
+                                            local dir, ft = vaLaunchIntercept(origin, tp, tv, speed)
+                                            if dir and (not CFG.vaLos
+                                                or vaLineOfSight(origin, tp, myChar, ch)) then
+                                                if isHeld then
+                                                    heldSol, heldFt, heldDist = dir, ft, dist
+                                                end
+                                                if not best or dist < bestDist then
+                                                    best = pl.Name
+                                                    bestSol, bestFt, bestDist = dir, ft, dist
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+
+                    if heldSol then
+                        best = lockName
+                        bestSol, bestFt, bestDist = heldSol, heldFt, heldDist
+                    end
+                    lockName = best
+                    vaStat.held = heldSol ~= nil
+
+                    vaStat.target = best
+                    vaStat.speed = speed
+                    vaStat.tier = tier
+                    vaStat.dist = bestDist
+                    vaStat.flight = bestFt
+                    vaStat.solved = bestSol ~= nil
+
+                    if bestSol then
+                        local want = bestSol
+                        local sm = CFG.vaSmooth or 1
+                        if sm > 1 then
+                            local tau = (sm - 1) * 0.015
+                            local a = 1 - math.exp(-dt / tau)
+                            local blend = look + (want - look) * a
+                            if blend.Magnitude > 1e-4 then want = blend.Unit end
+                        end
+                        vaWriteLook(addr, want)
+                    end
+                    vaStat.state = best and (bestSol and ("Locked " .. best) or "No clear solution")
+                        or "No target in range"
+                end)
+                vaStat.error = not okAim and tostring(aimError) or nil
+                if not okAim then vaStat.solved = false end
+            else
+                vaStat.solved = false
+                vaStat.state = addr and "Waiting for character" or "Resolving camera"
+            end
+        end
+
+        task.wait(1 / 144)
+    end
+end)
+
+-- hud: killer timers, generators, survivors
+HUD.lines, HUD.rows, HUD.count = {}, {}, 0
+HUD.k = { attrs = {} }
+HUD.order, HUD.perkList, HUD.cat = {}, {}, nil
+HUD.perkSlots, HUD.perkUnknown = 0, 0
+HUD.surv = {}
+HUD.seed = { chunk = 1, cursor = 0, live = nil, forChar = nil }
+HUD.survLive = { "Knocked", "IsHooked", "IsCarried" }
+HUD.x, HUD.y, HUD.w = nil, nil, 262
+HUD.drag, HUD.wasDown, HUD.shown = nil, false, false
+HUD.lastPoll, HUD.lastDraw, HUD.lastFind = 0, 0, 0
+HUD.findAt, HUD.perkAt, HUD.scanAt, HUD.survPollAt = 0, 0, 0, 0
+HUD.genNext, HUD.lastError = 0, nil
+HUD.pollMs, HUD.drawMs = 0, 0
+HUD.cReady = Color3.fromRGB(80, 255, 120)
+HUD.cCool = Color3.fromRGB(255, 170, 60)
+HUD.cWarn = Color3.fromRGB(255, 110, 110)
+HUD.cDim = Color3.fromRGB(170, 170, 170)
+HUD.cText = Color3.fromRGB(230, 230, 230)
+HUD.cTitle = Color3.fromRGB(255, 255, 255)
+
+HUD.abilities = {
+    Slasher = {
+        { attr = "LakeMist", label = "Invis", active = 13, cooldown = 60 },
+        { attr = "Pursuit", label = "Rage", active = 20, cooldown = 80 },
+    },
+    Veil = {
+        { attr = "Spears", label = "Spears", counter = true, recharge = 15 },
+        { attr = "special", label = "Charge", readyFlag = true, cooldown = 30 },
+    },
+}
+
+HUD.plain = {
+    BloodLust = true, IsStunned = true, Immobile = true,
+    IsCarrying = true, IsChasing = true, spearmode = true,
+}
+
+HUD.always = { BloodLust = true, TerrorRadius = true }
+
+HUD.skip = {
+    ChaseTargetUserId = true, CarriedSurvivorId = true, Chasemusic = true,
+    Suspense = true, ITEMINDEX = true, SuspenseRadius = true,
+    nostun = true, overridelookscript = true, speedboost = true,
+    swift = true, breakspeed = true,
+}
+
+HUD.baseline = {
+    HookCount = true, HookedProgress = true, Knocked = true,
+    speedboost = true, skillcheckspeed = true, IsRunning = true,
+    Iframes = true, repairboost = true, healboost = true,
+    unhookspeed = true, healnerf = true, bleedboost = true,
+    vaultspeed = true, skillcheckfrequency = true, Sprinting = true,
+    IsChased = true, chasereward = true, ChaseCount = true,
+    repairing = true, Parry = true, RemainingCarryTime = true,
+    HookProgressDepleting = true, HealProgress = true, Crouching = true,
+    Crouchingserver = true, HealingPaused = true, isvaulting = true,
+    vaultending = true, Untargettable = true, anticamp = true,
+    IsCarried = true, nogui = true, IsHooked = true,
+    overridelookscript = true, __VaultFireCount = true,
+}
+
+HUD.engine = {
+    MaterialSounds = true, cutscene = true, Sound = true,
+    ["Camera resetter"] = true, Animate = true, Lookscript = true,
+    R6RagdollClient = true, Health = true, ["Animations-new"] = true,
+    CheckInterractable = true, ["Skillcheck-gen"] = true,
+    ["Skillcheck-player"] = true, ["Highlight-forsurvivor"] = true,
+    heartbeat = true, Audioinit = true, SmoothCamera = true,
+    ProgressBar = true, Lock = true, Firstperson = true, VMscript = true,
+    carriedtransparency = true, Animations = true, voicemanager = true,
+    ["Left Arm"] = true, ["Left Leg"] = true, ["Right Arm"] = true,
+    ["Right Leg"] = true, Instinct = true, Killerost = true,
+}
+
+HUD.seed.fallback = {
+    "special", "Spears", "spearmode", "BloodLust",
+    "IsStunned", "Immobile", "IsCarrying",
+}
+
+HUD.genRate = function(t, prog, now)
+    local base, at = t.hudBase, t.hudBaseAt
+    if base and prog < base then
+        t.hudRate, t.hudEta, t.hudEtaAt = nil, nil, nil
+        t.hudBase, t.hudBaseAt = prog, now
+        return
+    end
+    if not at then
+        t.hudBase, t.hudBaseAt = prog, now
+        return
+    end
+    if now - at >= 3 then
+        local gained = prog - base
+        if gained > 0 then
+            local r = gained / (now - at)
+            t.hudRate = t.hudRate and (t.hudRate * 0.5 + r * 0.5) or r
+        elseif gained == 0 then
+            t.hudRate = nil
+        end
+        t.hudBase, t.hudBaseAt = prog, now
+    end
+end
+
+HUD.eta = function(t, now)
+    local r = t.hudRate
+    if not r or r <= 0.01 then
+        t.hudEta, t.hudEtaAt = nil, nil
+        return nil
+    end
+    local measured = (100 - (t.prog or 0)) / r
+    if measured < 0 then measured = 0 end
+    local shown = t.hudEta and (t.hudEta - (now - (t.hudEtaAt or now))) or nil
+    if not shown or shown < 0 or math.abs(shown - measured) > 4 then
+        t.hudEta, t.hudEtaAt = measured, now
+        shown = measured
+    end
+    if shown < 0 then shown = 0 end
+    return shown
+end
+
+HUD.where = function()
+    local ch = lp.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        local ok, p = pcall(function() return hrp.Position end)
+        if ok and p then return p.X, p.Y, p.Z end
+    end
+    local cam = Workspace.CurrentCamera
+    if cam then
+        local ok, cf = pcall(function() return cam.CFrame end)
+        if ok and cf then return cf.Position.X, cf.Position.Y, cf.Position.Z end
+    end
+    return 0, 0, 0
+end
+
+HUD.learned = function(rec)
+    local n = #rec.durations
+    if n == 0 then return nil end
+    local sorted = {}
+    for i = 1, n do sorted[i] = rec.durations[i] end
+    table.sort(sorted)
+    local median = sorted[math.floor((n + 1) / 2)]
+    return median, sorted[1], sorted[n], n
+end
+
+HUD.trackAttr = function(name, value, now)
+    local rec = HUD.k.attrs[name]
+    if not rec then
+        rec = { value = value, since = now, durations = {}, peak = nil }
+        if type(value) == "number" then rec.peak = value end
+        HUD.k.attrs[name] = rec
+        HUD.order[#HUD.order + 1] = name
+        return
+    end
+    if type(value) == "number" and (rec.peak == nil or value > rec.peak) then
+        rec.peak = value
+    end
+    if rec.value == value then return end
+    local prev = rec.value
+    rec.value = value
+    rec.since = now
+    rec.changes = (rec.changes or 0) + 1
+    if HUD.plain[name] then return end
+    local spent = (prev == true and value == false)
+        or (type(value) == "number" and type(prev) == "number" and value < prev)
+    local restored = (prev == false and value == true)
+        or (type(value) == "number" and type(prev) == "number" and value > prev)
+    if spent then
+        rec.downAt = now
+    elseif restored and rec.downAt then
+        local d = now - rec.downAt
+        rec.downAt = nil
+        if d > 0.2 and d < 300 then
+            rec.durations[#rec.durations + 1] = d
+            if #rec.durations > 12 then table.remove(rec.durations, 1) end
+            rec.lastDuration = d
+        end
+    end
+end
+
+HUD.trackAbility = function(spec, value, now)
+    local rec = HUD.k.attrs[spec.attr]
+    if not rec then
+        rec = { value = value, since = now, durations = {}, spec = spec }
+        if type(value) == "number" then rec.peak = value end
+        HUD.k.attrs[spec.attr] = rec
+        HUD.order[#HUD.order + 1] = spec.attr
+        return
+    end
+    rec.spec = spec
+    if type(value) == "number" and (rec.peak == nil or value > rec.peak) then
+        rec.peak = value
+    end
+    if rec.value == value then return end
+    local prev = rec.value
+    rec.value = value
+    rec.since = now
+
+    if spec.counter then
+        if type(value) == "number" and type(prev) == "number" then
+            if value < prev then
+                rec.downAt = now
+            elseif value > prev then
+                if rec.downAt then
+                    local d = now - rec.downAt
+                    if d > 0.2 and d < 300 then
+                        rec.durations[#rec.durations + 1] = d
+                        if #rec.durations > 12 then table.remove(rec.durations, 1) end
+                    end
+                end
+                if rec.peak and value < rec.peak then
+                    rec.downAt = now
+                else
+                    rec.downAt = nil
+                end
+            end
+        end
+        return
+    end
+
+    if spec.readyFlag then
+        if prev == true and value == false then
+            rec.activeUntil = nil
+            if spec.cooldown then
+                rec.readyAt = now + spec.cooldown
+            else
+                rec.downAt = now
+            end
+        elseif prev == false and value == true then
+            rec.readyAt = nil
+            rec.downAt = nil
+        end
+        return
+    end
+
+    if prev == false and value == true then
+        rec.activeUntil = spec.active and (now + spec.active) or nil
+        rec.readyAt = nil
+        rec.downAt = nil
+    elseif prev == true and value == false then
+        rec.activeUntil = nil
+        if spec.cooldown then
+            rec.readyAt = now + spec.cooldown
+        else
+            rec.downAt = now
+        end
+    end
+end
+
+HUD.seedNames = function(char, now)
+    if HUD.seed.forChar == char and HUD.seed.live
+            and (now or 0) - (HUD.seed.readAt or 0) < 10 then
+        return HUD.seed.live
+    end
+    local previous = (HUD.seed.forChar == char) and HUD.seed.live or nil
+    HUD.seed.readAt = now or 0
+    HUD.seed.forChar = char
+    local ok, names = pcall(function() return char:GetAttributes() end)
+    local list = {}
+    if ok and type(names) == "table" then
+        for _, n in pairs(names) do
+            if type(n) == "string" and not HUD.skip[n] then
+                list[#list + 1] = n
+            end
+        end
+        table.sort(list)
+    end
+    if #list == 0 then
+        for i = 1, #HUD.seed.fallback do list[i] = HUD.seed.fallback[i] end
+    end
+    if previous then
+        local have = {}
+        for i = 1, #list do have[list[i]] = true end
+        for i = 1, #previous do
+            if not have[previous[i]] then list[#list + 1] = previous[i] end
+        end
+        table.sort(list)
+    end
+    HUD.seed.live = list
+    return list
+end
+
+HUD.findKiller = function(now)
+    local K = HUD.k
+    local ch = K.char
+    if ch then
+        local ok, live = pcall(function() return ch.Parent ~= nil end)
+        if ok and live then
+            if now - (HUD.perkAt or 0) > 10 then
+                HUD.perkAt = now
+                pcall(HUD.readPerks, ch)
+            end
+            return ch
+        end
+    end
+    if now - HUD.lastFind < 2 then return nil end
+    HUD.lastFind = now
+    K.player, K.char, K.type = nil, nil, nil
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local ok, team = pcall(function() return plr.Team and plr.Team.Name end)
+        if ok and team == "Killer" then
+            K.player = plr
+            K.char = plr.Character
+            local okK, k = pcall(function() return plr:GetAttribute("SelectedKiller") end)
+            K.type = okK and k or nil
+            HUD.readPerks(K.char)
+            break
+        end
+    end
+    return K.char
+end
+
+HUD.pollKiller = function(now)
+    local K = HUD.k
+    local char = K.char
+    if not char or (now - (HUD.findAt or 0)) >= 1 then
+        HUD.findAt = now
+        char = HUD.findKiller(now)
+    end
+    if not char then
+        if #HUD.order > 0 then K.attrs, HUD.order = {}, {} end
+        return
+    end
+
+    local known = K.type and HUD.abilities[K.type]
+
+    if known then
+        HUD.specCursor = (HUD.specCursor or 0) % #known + 1
+        local spec = known[HUD.specCursor]
+        local ok, v = pcall(function() return char:GetAttribute(spec.attr) end)
+        if ok and v ~= nil and type(v) ~= "table" then
+            HUD.trackAbility(spec, v, now)
+        end
+    end
+
+    if known and now - (HUD.seedAt or 0) < 0.5 then return end
+    HUD.seedAt = now
+
+    local specFor = nil
+    if known then
+        specFor = {}
+        for i = 1, #known do specFor[known[i].attr] = known[i] end
+    end
+
+    local names = HUD.seedNames(char, now)
+    local n = #names
+    if n == 0 then return end
+    HUD.seed.cursor = HUD.seed.cursor % n + 1
+    local name = names[HUD.seed.cursor]
+    local ok, v = pcall(function() return char:GetAttribute(name) end)
+    if ok and v ~= nil and type(v) ~= "table" then
+        local spec = specFor and specFor[name]
+        if spec then
+            HUD.trackAbility(spec, v, now)
+        else
+            HUD.trackAttr(name, v, now)
+        end
+    end
+end
+
+HUD.perkNameFor = function(attr)
+    if not HUD.cat then
+        HUD.cat = {}
+        local okF, folder = pcall(function()
+            return game:GetService("ReplicatedStorage"):FindFirstChild("Perks")
+        end)
+        if okF and folder then
+            local ok, kids = pcall(function() return folder:GetChildren() end)
+            if ok and type(kids) == "table" then
+                for i = 1, #kids do
+                    local display = kids[i].Name
+                    HUD.cat[lower(display):gsub("[^%a]", "")] = display
+                end
+            end
+        end
+    end
+    local key = lower(attr):gsub("[^%a]", "")
+    if HUD.cat[key] then return HUD.cat[key] end
+    for k, display in pairs(HUD.cat) do
+        if #k >= 6 and key:sub(1, #k) == k then return display end
+    end
+    return nil
+end
+
+HUD.readPerks = function(char)
+    HUD.perkList = {}
+    HUD.perkSlots, HUD.perkUnknown = 0, 0
+    if not char then return end
+    local ok, kids = pcall(function() return char:GetChildren() end)
+    if not ok then return end
+
+    local slots = 0
+    for i = 1, #kids do
+        local c = kids[i]
+        if c.ClassName == "Script" or c.ClassName == "LocalScript" then
+            local named = string.match(tostring(c.Name), "^(.-)%s+%d+$")
+            local tierOnly = tonumber(c.Name) ~= nil
+            if named and named ~= "" then
+                slots = slots + 1
+                HUD.perkList[#HUD.perkList + 1] = named
+            elseif tierOnly then
+                slots = slots + 1
+            end
+        end
+    end
+
+    local okA, names = pcall(function() return char:GetAttributes() end)
+    if okA and type(names) == "table" then
+        local seen = {}
+        for i = 1, #HUD.perkList do seen[HUD.perkList[i]] = true end
+        for _, n in pairs(names) do
+            if type(n) == "string" and not HUD.baseline[n] then
+                local display = HUD.perkNameFor(n)
+                if display and not seen[display] then
+                    seen[display] = true
+                    HUD.perkList[#HUD.perkList + 1] = display
+                end
+            end
+        end
+    end
+
+    HUD.perkSlots = slots
+    HUD.perkUnknown = slots - #HUD.perkList
+    if HUD.perkUnknown < 0 then HUD.perkUnknown = 0 end
+end
+
+HUD.scanSurvivor = function(plr)
+    local char = plr.Character
+    if not char then return nil end
+    local e = { player = plr, name = plr.Name, char = char, perks = {}, state = {} }
+
+    local okI, item = pcall(function() return plr:GetAttribute("EquippedItem") end)
+    e.item = (okI and item) and tostring(item) or nil
+
+    local ok, kids = pcall(function() return char:GetChildren() end)
+    if ok and type(kids) == "table" then
+        for i = 1, #kids do
+            local c = kids[i]
+            if c.ClassName == "Model" and c.Name ~= "Weapon" then
+                e.item = c.Name
+                break
+            end
+        end
+    end
+
+    local okN, names = pcall(function() return char:GetAttributes() end)
+    if okN and type(names) == "table" then
+        local seen = {}
+        for _, n in pairs(names) do
+            if type(n) == "string" and not HUD.baseline[n] then
+                local display = HUD.perkNameFor(n)
+                if display and not seen[display] then
+                    seen[display] = true
+                    e.perks[#e.perks + 1] = display
+                end
+            end
+        end
+    end
+
+    local scripts = 0
+    if ok and type(kids) == "table" then
+        for i = 1, #kids do
+            local c = kids[i]
+            if (c.ClassName == "Script" or c.ClassName == "LocalScript")
+                    and not HUD.engine[c.Name] then
+                scripts = scripts + 1
+            end
+        end
+    end
+    e.perkScripts = scripts
+    e.unknownPerks = scripts - #e.perks
+    if e.unknownPerks < 0 then e.unknownPerks = 0 end
+    return e
+end
+
+HUD.rescanSurvivors = function()
+    HUD.surv = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local ok, team = pcall(function() return plr.Team and plr.Team.Name end)
+        if ok and team == "Survivors" then
+            local e = HUD.scanSurvivor(plr)
+            if e then HUD.surv[#HUD.surv + 1] = e end
+        end
+    end
+end
+
+HUD.pollSurvivors = function(now)
+    for i = 1, #HUD.surv do
+        local e = HUD.surv[i]
+        local char = e.char
+        if char then
+            local okLive, live = pcall(function() return char.Parent ~= nil end)
+            if okLive and live then
+                for j = 1, #HUD.survLive do
+                    local key = HUD.survLive[j]
+                    local ok, v = pcall(function() return char:GetAttribute(key) end)
+                    if ok then e.state[key] = v end
+                end
+            end
+        end
+    end
+end
+
+HUD.isKillerCached, HUD.isKillerAt = false, -100
+
+HUD.localIsKiller = function()
+    local now = os.clock()
+    if now - HUD.isKillerAt < 2 then return HUD.isKillerCached end
+    HUD.isKillerAt = now
+    local team = nil
+    pcall(function() team = lp.Team and lp.Team.Name end)
+    HUD.isKillerCached = team == "Killer"
+    return HUD.isKillerCached
+end
+
+HUD.renderGens = function(put, now)
+    put("GENERATORS", HUD.cTitle)
+    if #genList == 0 then
+        put("  none", HUD.cDim)
+        return
+    end
+    local px, py, pz = HUD.where()
+    local list = {}
+    for i = 1, #genList do
+        local t = genList[i]
+        if not t.hudId then
+            HUD.genNext = HUD.genNext + 1
+            t.hudId = HUD.genNext
+        end
+        if t.pos then
+            local dx, dy, dz = t.pos.X - px, t.pos.Y - py, t.pos.Z - pz
+            t.hudDist = math.floor(math.sqrt(dx * dx + dy * dy + dz * dz) + 0.5)
+        else
+            t.hudDist = 0
+        end
+        list[i] = t
+    end
+    table.sort(list, function(a, b)
+        local pa, pb = math.floor(a.prog or 0), math.floor(b.prog or 0)
+        if pa ~= pb then return pa > pb end
+        if (a.hudDist or 0) ~= (b.hudDist or 0) then return (a.hudDist or 0) < (b.hudDist or 0) end
+        return (a.hudId or 0) < (b.hudId or 0)
+    end)
+
+    for i = 1, #list do
+        local t = list[i]
+        local prog = math.floor(t.prog or 0)
+        local crew = t.crew or 0
+        local txt = string.format("%3d%%  %4dm", prog, t.hudDist or 0)
+        if crew > 0 then txt = txt .. "  x" .. crew end
+        local colour = HUD.cDim
+        if prog >= 100 then
+            colour = HUD.cReady
+            txt = txt .. "  done"
+        elseif t.state == "paused" then
+            colour = HUD.cCool
+        elseif crew > 0 then
+            colour = HUD.cCool
+            local left = HUD.eta(t, now)
+            if left then txt = txt .. string.format("  %ds", math.floor(left + 0.5)) end
+        elseif t.state == "regress" then
+            colour = HUD.cWarn
+        end
+        put("  " .. txt, colour)
+    end
+end
+
+HUD.renderTraps = function(put)
+    put("BEAR TRAPS", HUD.cTitle)
+    if #trapList == 0 then
+        put("  none", HUD.cDim)
+        return
+    end
+    local px, py, pz = HUD.where()
+    local list = {}
+    for i = 1, #trapList do
+        local t = trapList[i]
+        local dx, dy, dz = t.pos.X - px, t.pos.Y - py, t.pos.Z - pz
+        t.hudDist = math.floor(math.sqrt(dx * dx + dy * dy + dz * dz) + 0.5)
+        list[i] = t
+    end
+    table.sort(list, function(a, b)
+        if a.hudDist ~= b.hudDist then return a.hudDist < b.hudDist end
+        return (a.id or 0) < (b.id or 0)
+    end)
+    for i = 1, #list do
+        local t = list[i]
+        put("  " .. trapLabel(t, t.hudDist),
+            (t.armed == false) and HUD.cWarn or HUD.cReady)
+    end
+end
+
+HUD.renderSurvivors = function(put)
+    put("SURVIVORS", HUD.cTitle)
+    if #HUD.surv == 0 then
+        put("  none", HUD.cDim)
+        return
+    end
+    for i = 1, #HUD.surv do
+        local e = HUD.surv[i]
+        local st = e.state
+        local tag, colour
+        if st.IsHooked == true then
+            tag, colour = "hooked", HUD.cReady
+        elseif st.IsCarried == true then
+            tag, colour = "carried", HUD.cReady
+        elseif st.Knocked == true then
+            tag, colour = "downed", HUD.cWarn
+        else
+            tag, colour = nil, HUD.cText
+        end
+        local head = e.name
+        if e.item then head = head .. "  " .. e.item end
+        if tag then head = head .. "  [" .. tag .. "]" end
+        put(head, colour)
+        if CFG.hudPerks then
+            for j = 1, #e.perks do put("  " .. e.perks[j], HUD.cDim) end
+            if (e.unknownPerks or 0) > 0 then
+                put("  +" .. e.unknownPerks .. " unidentified", HUD.cDim)
+            end
+        end
+    end
+end
+
+HUD.build = function(now)
+    local L = HUD.lines
+    local n = 0
+    local function put(t, c)
+        if n >= 44 then return end
+        n = n + 1
+        local e = L[n]
+        if not e then e = {} L[n] = e end
+        local s = tostring(t)
+        if #s > 34 then s = s:sub(1, 32) .. ".." end
+        e.t, e.c = s, c or HUD.cText
+    end
+
+    local K = HUD.k
+    if K.char then
+        put("KILLER  " .. tostring(K.type or "?")
+            .. (K.player and ("  " .. K.player.Name) or ""), HUD.cTitle)
+    else
+        put("KILLER  not found", HUD.cDim)
+    end
+
+    if CFG.hudAbilities then
+        for i = 1, #HUD.order do
+            local name = HUD.order[i]
+            local rec = K.attrs[name]
+            local worth = (rec and rec.changes and rec.changes > 0)
+                or HUD.always[name] or (rec and rec.spec ~= nil)
+            if rec and worth and (CFG.hudState or not HUD.plain[name]) then
+                local label, colour
+                if HUD.plain[name] then
+                    local v = rec.value
+                    if v == true then
+                        label, colour = name .. ": yes", HUD.cWarn
+                    elseif v == false then
+                        label, colour = name .. ": no", HUD.cDim
+                    else
+                        label = name .. ": " .. tostring(v)
+                        colour = (type(v) == "number" and v > 0) and HUD.cWarn or HUD.cDim
+                    end
+                elseif rec.spec and rec.spec.counter then
+                    local shown = rec.spec.label or name
+                    local count = tostring(rec.value)
+                        .. (rec.peak and ("/" .. tostring(rec.peak)) or "")
+                    if rec.downAt then
+                        local elapsed = now - rec.downAt
+                        local median = rec.spec.recharge or HUD.learned(rec)
+                        if median then
+                            local left = median - elapsed
+                            if left < 0 then left = 0 end
+                            label = string.format("%s   %s   %.0fs", shown, count, left)
+                        else
+                            label = string.format("%s   %s   %.0fs", shown, count, elapsed)
+                        end
+                        colour = HUD.cCool
+                    else
+                        label = string.format("%s   %s", shown, count)
+                        colour = HUD.cReady
+                    end
+                elseif rec.activeUntil then
+                    local left = rec.activeUntil - now
+                    if left <= 0 then
+                        rec.activeUntil = nil
+                        label = (rec.spec and rec.spec.label or name) .. "   active"
+                        colour = HUD.cWarn
+                    else
+                        label = string.format("%s   ACTIVE %.1fs",
+                            rec.spec and rec.spec.label or name, left)
+                        colour = HUD.cWarn
+                    end
+                elseif rec.readyAt then
+                    local left = rec.readyAt - now
+                    if left <= 0 then
+                        rec.readyAt = nil
+                        label = (rec.spec and rec.spec.label or name) .. "   ready"
+                        colour = HUD.cReady
+                    else
+                        label = string.format("%s   %.0fs",
+                            rec.spec and rec.spec.label or name, left)
+                        colour = HUD.cCool
+                    end
+                elseif rec.downAt then
+                    local elapsed = now - rec.downAt
+                    local median = HUD.learned(rec)
+                    local shown = rec.spec and rec.spec.label or name
+                    if median then
+                        local left = median - elapsed
+                        if left < 0 then left = 0 end
+                        label = string.format("%s   %.1fs", shown, left)
+                        colour = HUD.cCool
+                    else
+                        label = string.format("%s   %s", shown, tostring(rec.value))
+                        colour = HUD.cDim
+                    end
+                else
+                    local shown = rec.spec and rec.spec.label or name
+                    if rec.spec and rec.spec.readyFlag and rec.value == false then
+                        label, colour = shown .. "   on cooldown", HUD.cCool
+                    elseif type(rec.value) == "number" then
+                        local suffix = ""
+                        if rec.peak and rec.peak ~= rec.value then
+                            suffix = "/" .. tostring(rec.peak)
+                        end
+                        label = shown .. "   " .. tostring(rec.value) .. suffix
+                        colour = HUD.cReady
+                    else
+                        label, colour = shown .. "   ready", HUD.cReady
+                    end
+                end
+                put(label, colour)
+            end
+        end
+    end
+
+    if CFG.hudPerks and ((HUD.perkSlots or 0) > 0 or #HUD.perkList > 0) then
+        put("PERKS", HUD.cTitle)
+        for i = 1, #HUD.perkList do
+            put("  " .. HUD.perkList[i], HUD.cDim)
+        end
+        if (HUD.perkUnknown or 0) > 0 then
+            put("  +" .. HUD.perkUnknown .. " unnamed", HUD.cDim)
+        end
+    end
+
+    if CFG.hudGens then
+        put(" ", HUD.cDim)
+        HUD.renderGens(put, now)
+    end
+
+    if CFG.hudTraps then
+        put(" ", HUD.cDim)
+        HUD.renderTraps(put)
+    end
+
+    if CFG.hudSurvivors and HUD.localIsKiller() then
+        put(" ", HUD.cDim)
+        HUD.renderSurvivors(put)
+    end
+
+    for i = n + 1, #L do L[i] = nil end
+    HUD.lineCount = n
+end
+
+HUD.obj = function(kind, z)
+    local ok, d = pcall(Drawing.new, kind)
+    if not ok or not d then return nil end
+    pcall(function() d.Visible = false; d.ZIndex = z end)
+    return d
+end
+
+HUD.hide = function()
+    if not HUD.bg then return end
+    HUD.bg.Visible = false
+    HUD.border.Visible = false
+    HUD.accent.Visible = false
+    HUD.title.Visible = false
+    if HUD.close then HUD.close.Visible = false end
+    for _, r in ipairs(HUD.rows) do r.t.Visible = false end
+    HUD.shown = false
+end
+
+HUD.destroy = function()
+    if HUD.bg then pcall(function() HUD.bg:Remove() end) end
+    if HUD.border then pcall(function() HUD.border:Remove() end) end
+    if HUD.accent then pcall(function() HUD.accent:Remove() end) end
+    if HUD.title then pcall(function() HUD.title:Remove() end) end
+    if HUD.close then pcall(function() HUD.close:Remove() end) end
+    for _, r in ipairs(HUD.rows) do pcall(function() r.t:Remove() end) end
+    HUD.bg, HUD.border, HUD.accent, HUD.title, HUD.close = nil, nil, nil, nil, nil
+    HUD.rows, HUD.shown, HUD.count = {}, false, 0
+    HUD.gx, HUD.gy, HUD.gw, HUD.gh = nil, nil, nil, nil
+end
+
+HUD.ensure = function()
+    if HUD.bg then return true end
+    local ok = pcall(function()
+        HUD.bg = HUD.obj("Square", 45)
+        HUD.bg.Filled = true
+        HUD.bg.Corner = 4
+        HUD.border = HUD.obj("Square", 46)
+        HUD.border.Filled = false
+        HUD.border.Thickness = 1
+        HUD.border.Corner = 4
+        HUD.accent = HUD.obj("Square", 47)
+        HUD.accent.Filled = true
+        HUD.title = HUD.obj("Text", 48)
+        HUD.title.Text = "HUD"
+        HUD.title.Size = 14
+        HUD.title.Font = FONT
+        HUD.title.Outline = false
+        HUD.title.Transparency = 1
+        HUD.close = HUD.obj("Text", 49)
+        HUD.close.Text = "x"
+        HUD.close.Size = 14
+        HUD.close.Font = FONT
+        HUD.close.Outline = false
+        HUD.close.Transparency = 1
+    end)
+    if not ok or not HUD.bg then
+        HUD.destroy()
+        return false
+    end
+    return true
+end
+
+HUD.row = function(i)
+    local r = HUD.rows[i]
+    if r then return r end
+    local t = HUD.obj("Text", 48)
+    if not t then return nil end
+    t.Size, t.Font, t.Outline = 13, FONT, false
+    t.Transparency = 1
+    r = { t = t }
+    HUD.rows[i] = r
+    return r
+end
+
+HUD.setEnabled = function(on)
+    on = on and true or false
+    local el = HUD.toggleEl
+    if el then
+        if el.value ~= on then el:SetValue(on) end
+        for _, a in ipairs(el.addons or {}) do
+            if a.kind == "KeyPicker" then a.state = on end
+        end
+    end
+    CFG.hud = on
+    if not on then HUD.hide() end
+    return CFG.hud
+end
+
+HUD.render = function(now, moveOnly)
+    if not CFG.hud or not running then
+        if HUD.shown then HUD.hide() end
+        return
+    end
+    if not moveOnly then HUD.build(now) end
+    if not HUD.ensure() then return end
+
+    local lines = HUD.lines
+    local n = #lines
+    if n == 0 then if HUD.shown then HUD.hide() end return end
+
+    local w = HUD.w
+    local h = 26 + n * 16 + 6
+    local cam = Workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize
+    local vw, vh = (vp and vp.X) or 1920, (vp and vp.Y) or 1080
+    if not HUD.x then
+        HUD.x, HUD.y = vw - w - 12, 44
+    end
+
+    local x, y = HUD.x, HUD.y
+    local mx, my, down, rdown
+    pcall(function() mx, my = mouse.X, mouse.Y end)
+    pcall(function() down = ismouse1pressed() == true end)
+    pcall(function() rdown = ismouse2pressed() == true end)
+
+    local closeX, closeY = x + w - 20, y + 5
+    local over = mx and mx >= x and mx <= x + w and my >= y and my <= y + h
+    local overClose = mx and mx >= closeX and mx <= closeX + 14 and my >= closeY and my <= closeY + 14
+
+    if mx and down and not HUD.wasDown then
+        if overClose then
+            HUD.wasDown = true
+            HUD.setEnabled(false)
+            return
+        elseif over then
+            HUD.drag = { mx - x, my - y }
+        end
+    end
+    if not down then HUD.drag = nil end
+    if HUD.drag and mx then
+        x = math.clamp(mx - HUD.drag[1], 0, vw - w)
+        y = math.clamp(my - HUD.drag[2], 0, vh - 40)
+        HUD.x, HUD.y = x, y
+    end
+    HUD.wasDown = down == true
+
+    if over and rdown and not HUD.wasRight then
+        HUD.wasRight = true
+        HUD.setEnabled(false)
+        return
+    end
+    HUD.wasRight = rdown == true
+
+    local bgAlpha = 1 - math.clamp(CFG.hudAlpha or 0, 0, 100) / 100
+
+    local L = UI
+    local theme = (L and L.Theme) or {}
+    local cBg = theme.bg or Color3.fromRGB(15, 15, 15)
+    local cLine = theme.outline or Color3.fromRGB(40, 40, 40)
+    local cAcc = theme.accent or Color3.fromRGB(124, 92, 255)
+    local cTxt = theme.text or Color3.fromRGB(255, 255, 255)
+
+    if HUD.gx ~= x or HUD.gy ~= y or HUD.gw ~= w or HUD.gh ~= h then
+        HUD.bg.Position = Vector2.new(x, y)
+        HUD.bg.Size = Vector2.new(w, h)
+        HUD.border.Position = Vector2.new(x, y)
+        HUD.border.Size = Vector2.new(w, h)
+        HUD.accent.Position = Vector2.new(x + 1, y + 24)
+        HUD.accent.Size = Vector2.new(w - 2, 1)
+        HUD.title.Position = Vector2.new(x + 10, y + 4)
+        HUD.close.Position = Vector2.new(x + w - 18, y + 3)
+        HUD.gx, HUD.gy, HUD.gw, HUD.gh = x, y, w, h
+    end
+
+    if HUD.cBg ~= cBg or HUD.aBg ~= bgAlpha then
+        HUD.bg.Color = cBg
+        HUD.bg.Transparency = bgAlpha * 0.96
+        HUD.cBg, HUD.aBg = cBg, bgAlpha
+    end
+    if HUD.cLine ~= cLine then HUD.border.Color = cLine HUD.cLine = cLine end
+    if HUD.cAcc ~= cAcc then HUD.accent.Color = cAcc HUD.cAcc = cAcc end
+    if HUD.cTxt ~= cTxt then HUD.title.Color = cTxt HUD.cTxt = cTxt end
+    if HUD.aChrome ~= bgAlpha then
+        HUD.border.Transparency = bgAlpha
+        HUD.accent.Transparency = bgAlpha
+        HUD.aChrome = bgAlpha
+    end
+
+    local cClose = overClose and cAcc or cLine
+    if HUD.cClose ~= cClose then HUD.close.Color = cClose HUD.cClose = cClose end
+
+    if not HUD.shown then
+        HUD.bg.Visible = true
+        HUD.border.Visible = true
+        HUD.accent.Visible = true
+        HUD.title.Visible = true
+        HUD.close.Visible = true
+        HUD.shown = true
+    end
+
+    for i = 1, n do
+        local r = HUD.row(i)
+        local d = lines[i]
+        if r and d then
+            if r.text ~= d.t then
+                r.t.Text = d.t
+                r.text = d.t
+            end
+            if r.colour ~= d.c then
+                r.t.Color = d.c
+                r.colour = d.c
+            end
+            local rx, ry = x + 10, y + 28 + (i - 1) * 16
+            if r.rx ~= rx or r.ry ~= ry then
+                r.t.Position = Vector2.new(rx, ry)
+                r.rx, r.ry = rx, ry
+            end
+            if not r.t.Visible then r.t.Visible = true end
+        end
+    end
+    for i = n + 1, #HUD.rows do
+        local r = HUD.rows[i]
+        if r.t.Visible then r.t.Visible = false end
+    end
+    HUD.count = n
+end
+
+HUD.tick = function()
+    if not CFG.hud then
+        if HUD.shown then HUD.hide() end
+        return
+    end
+    local now = os.clock()
+    local every = (HUD.k.type and HUD.abilities[HUD.k.type]) and 0.2 or 0.1
+    if now - HUD.lastPoll >= every then
+        HUD.lastPoll = now
+        local t0 = os.clock()
+        pcall(HUD.pollKiller, now)
+        HUD.pollMs = HUD.pollMs * 0.9 + (os.clock() - t0) * 1000 * 0.1
+    end
+    if CFG.hudSurvivors and HUD.localIsKiller() then
+        if now - HUD.scanAt >= 8 then
+            HUD.scanAt = now
+            local t0 = os.clock()
+            pcall(HUD.rescanSurvivors)
+            HUD.pollMs = HUD.pollMs * 0.9 + (os.clock() - t0) * 1000 * 0.1
+        end
+        if now - HUD.survPollAt >= 2 then
+            HUD.survPollAt = now
+            local t0 = os.clock()
+            pcall(HUD.pollSurvivors, now)
+            HUD.pollMs = HUD.pollMs * 0.9 + (os.clock() - t0) * 1000 * 0.1
+        end
+    end
+    local moving = HUD.drag ~= nil
+    if moving or now - HUD.lastDraw >= 1 / 8 then
+        HUD.lastDraw = now
+        local t0 = os.clock()
+        pcall(HUD.render, now, moving)
+        HUD.drawMs = HUD.drawMs * 0.9 + (os.clock() - t0) * 1000 * 0.1
+    end
+end
+
+task.spawn(function()
+    while running do
+        local ok, err = pcall(HUD.tick)
+        if not ok then HUD.lastError = tostring(err) end
+        task.wait(ok and (HUD.drag and 1 / 60 or (CFG.hud and 0.05 or 0.25)) or 0.5)
+    end
+    pcall(HUD.destroy)
+end)
+
+API.hud = {}
+function API.hud.SetEnabled(on)
+    return HUD.setEnabled(on)
+end
+function API.hud.Toggle() return API.hud.SetEnabled(not CFG.hud) end
+function API.hud.SetTransparency(v)
+    CFG.hudAlpha = math.clamp(tonumber(v) or 0, 0, 100)
+    return CFG.hudAlpha
+end
+function API.hud.Lines()
+    local out = {}
+    for i = 1, #HUD.lines do out[i] = HUD.lines[i].t end
+    return out
+end
+function API.hud.Panel()
+    return {
+        shown = HUD.shown, x = HUD.x, y = HUD.y, w = HUD.w,
+        visible = HUD.bg and HUD.bg.Visible or false,
+        rows = #HUD.rows,
+        bg = HUD.bg and HUD.bg.Transparency or nil,
+        title = HUD.title and HUD.title.Text or nil,
+        textAlpha = HUD.rows[1] and HUD.rows[1].t.Transparency or nil,
+    }
+end
+function API.hud.Stats()
+    return {
+        lines = HUD.count,
+        killer = HUD.k and HUD.k.type or nil,
+        gens = #genList,
+        traps = #trapList,
+        survivors = #HUD.surv,
+        perkSlots = HUD.perkSlots,
+        alpha = CFG.hudAlpha,
+        drawMs = HUD.drawMs,
+        pollMs = HUD.pollMs,
+        error = HUD.lastError,
+    }
+end
+
+-- keybind window
+local kbw = {
+    x = 12, y = 44, w = 230, h = 0,
+    rows = {}, drag = nil, wasDown = false, shown = false,
+}
+
+local function kbwNew(kind, z)
+    local ok, d = pcall(Drawing.new, kind)
+    if not ok or not d then return nil end
+    pcall(function() d.Visible = false; d.ZIndex = z end)
+    return d
+end
+
+local function kbwHide()
+    if not kbw.bg then return end
+    kbw.bg.Visible = false
+    kbw.border.Visible = false
+    kbw.accent.Visible = false
+    kbw.title.Visible = false
+    for _, r in ipairs(kbw.rows) do
+        r.name.Visible = false
+        r.key.Visible = false
+    end
+    kbw.shown = false
+end
+
+kbwDestroy = function()
+    if kbw.bg then pcall(function() kbw.bg:Remove() end) end
+    if kbw.border then pcall(function() kbw.border:Remove() end) end
+    if kbw.accent then pcall(function() kbw.accent:Remove() end) end
+    if kbw.title then pcall(function() kbw.title:Remove() end) end
+    for _, r in ipairs(kbw.rows) do
+        pcall(function() r.name:Remove() end)
+        pcall(function() r.key:Remove() end)
+    end
+    kbw.bg, kbw.border, kbw.accent, kbw.title = nil, nil, nil, nil
+    kbw.rows, kbw.shown = {}, false
+    kbw.gx, kbw.gy, kbw.gw, kbw.gh = nil, nil, nil, nil
+end
+
+local function kbwEnsure()
+    if kbw.bg then return true end
+    local ok = pcall(function()
+        kbw.bg = kbwNew("Square", 55)
+        kbw.bg.Filled = true
+        kbw.bg.Corner = 4
+        kbw.bg.Transparency = 1
+        kbw.border = kbwNew("Square", 56)
+        kbw.border.Filled = false
+        kbw.border.Thickness = 1
+        kbw.border.Corner = 4
+        kbw.border.Transparency = 1
+        kbw.accent = kbwNew("Square", 57)
+        kbw.accent.Filled = true
+        kbw.accent.Transparency = 0.85
+        kbw.title = kbwNew("Text", 58)
+        kbw.title.Text = "Keybinds"
+        kbw.title.Size = 14
+        kbw.title.Font = FONT
+        kbw.title.Outline = false
+        kbw.title.Transparency = 1
+    end)
+    if not ok or not kbw.bg then
+        kbwDestroy()
+        return false
+    end
+    return true
+end
+
+local function kbwRow(i)
+    local r = kbw.rows[i]
+    if r then return r end
+    local name, key = kbwNew("Text", 58), kbwNew("Text", 58)
+    if not name or not key then return nil end
+    name.Size, name.Font, name.Outline = 13, FONT, false
+    key.Size, key.Font, key.Outline = 12, FONT, false
+    name.Transparency, key.Transparency = 1, 1
+    r = { name = name, key = key }
+    kbw.rows[i] = r
+    return r
+end
+
+local function kbwRender()
+    local L = UI
+    if not L then return end
+    if not CFG.kbw or not running then
+        if kbw.shown then kbwHide() end
+        return
+    end
+    if not kbwEnsure() then return end
+
+    local list = {}
+    for _, el in ipairs(L.__keybinds or {}) do
+        if el.vk or el.mode == "Always" then
+            local p = el.syncParent
+            local on
+            if el.mode == "Always" then on = true
+            elseif p then on = p.value == true
+            else on = el.state == true end
+            list[#list + 1] = {
+                name = tostring((p and p.text) or el.text or "Feature"),
+                key = el.vk and ("[" .. tostring(L.__vkName and L.__vkName(el.vk) or el.vk) .. "]") or "[Always]",
+                on = on,
+            }
+        end
+    end
+    if #list == 0 then
+        list[1] = { name = "No keybinds set", key = "", on = false }
+    end
+
+    local rows = #list
+    local w = kbw.w
+    local h = 26 + rows * 18 + 6
+    local x, y = kbw.x, kbw.y
+
+    local mx, my, down
+    pcall(function() mx, my = mouse.X, mouse.Y end)
+    pcall(function() down = ismouse1pressed() == true end)
+    if mx then
+        if down and not kbw.wasDown and mx >= x and mx <= x + w and my >= y and my <= y + 24 then
+            kbw.drag = { mx - x, my - y }
+        end
+        if not down then kbw.drag = nil end
+        if kbw.drag then
+            local cam = Workspace.CurrentCamera
+            local vp = cam and cam.ViewportSize
+            x = math.clamp(mx - kbw.drag[1], 0, (vp and vp.X or 1920) - w)
+            y = math.clamp(my - kbw.drag[2], 0, (vp and vp.Y or 1080) - h)
+            kbw.x, kbw.y = x, y
+        end
+    end
+    kbw.wasDown = down == true
+
+    local theme = L.Theme or {}
+    local cBg = theme.bg or Color3.fromRGB(15, 15, 15)
+    local cLine = theme.outline or Color3.fromRGB(40, 40, 40)
+    local cAccent = theme.accent or Color3.fromRGB(125, 85, 255)
+    local cOn = theme.text or Color3.fromRGB(255, 255, 255)
+    local cOff = theme.subtext or Color3.fromRGB(130, 130, 130)
+
+    if kbw.gx ~= x or kbw.gy ~= y or kbw.gw ~= w or kbw.gh ~= h then
+        kbw.bg.Position = Vector2.new(x, y)
+        kbw.bg.Size = Vector2.new(w, h)
+        kbw.border.Position = Vector2.new(x, y)
+        kbw.border.Size = Vector2.new(w, h)
+        kbw.accent.Position = Vector2.new(x + 1, y + 24)
+        kbw.accent.Size = Vector2.new(w - 2, 1)
+        kbw.title.Position = Vector2.new(x + 10, y + 4)
+        kbw.gx, kbw.gy, kbw.gw, kbw.gh = x, y, w, h
+    end
+    if kbw.cBg ~= cBg then kbw.bg.Color = cBg; kbw.cBg = cBg end
+    if kbw.cLine ~= cLine then kbw.border.Color = cLine; kbw.cLine = cLine end
+    if kbw.cAccent ~= cAccent then
+        kbw.accent.Color = cAccent
+        kbw.cAccent = cAccent
+    end
+    if kbw.cOn ~= cOn then
+        kbw.title.Color = cOn
+        kbw.cOn = cOn
+    end
+    if kbw.cRowOn ~= cOn or kbw.cRowOff ~= cOff then
+        kbw.cRowOn, kbw.cRowOff = cOn, cOff
+        for i = 1, #kbw.rows do kbw.rows[i].on = nil end
+    end
+
+    if not kbw.shown then
+        kbw.bg.Visible = true
+        kbw.border.Visible = true
+        kbw.accent.Visible = true
+        kbw.title.Visible = true
+        kbw.shown = true
+    end
+
+    for i = 1, rows do
+        local r = kbwRow(i)
+        local d = list[i]
+        if r and d then
+            local nm = d.name
+            if #nm > 17 then nm = nm:sub(1, 15) .. "..." end
+            if r.n ~= nm then r.name.Text = nm; r.n = nm end
+            if r.k ~= d.key then r.key.Text = d.key; r.k = d.key end
+            local rx, ry = x + 10, y + 28 + (i - 1) * 18
+            if r.x ~= rx or r.y ~= ry then
+                r.name.Position = Vector2.new(rx, ry)
+                r.key.Position = Vector2.new(x + 148, ry + 1)
+                r.x, r.y = rx, ry
+            end
+            if r.on ~= d.on then
+                local c = d.on and cOn or cOff
+                r.name.Color = c
+                r.key.Color = c
+                r.on = d.on
+            end
+            if not r.name.Visible then
+                r.name.Visible = true
+                r.key.Visible = true
+            end
+        end
+    end
+    for i = rows + 1, #kbw.rows do
+        local r = kbw.rows[i]
+        if r.name.Visible then
+            r.name.Visible = false
+            r.key.Visible = false
+        end
+    end
+end
+
+task.spawn(function()
+    while running do
+        local ok = pcall(kbwRender)
+        task.wait(ok and 1 / 30 or 0.5)
+    end
+    pcall(kbwDestroy)
+end)
 
 -- ui: swangy by aphalia
 local UI_EMBEDDED = {
@@ -2185,6 +4135,7 @@ local function vkName(vk)
     if vk == nil or vk == 0 then return "None" end
     return VK_NAME[vk] or tostring(vk)
 end
+Library.__vkName = vkName
 
 local capturing
 local focusedInput
@@ -2284,7 +4235,6 @@ end
 local Windows = {}
 local menuVk = VK.RightShift
 local watermarkOn = true
-local fps, frameCount, fpsClock = 0, 0, clock()
 local notifs = {}
 
 local function hideAll()
@@ -3898,8 +5848,7 @@ local function connectRender(cb)
 end
 
 local function win0Text()
-    local win = Windows[1]
-    return fmt("%s  |  %d fps", win and win.title or "Swangy", fps)
+    return "Swangy"
 end
 
 local function tickLoop(dt)
@@ -3910,11 +5859,6 @@ local function tickLoop(dt)
     end
     local ok, err = pcall(function()
         poll()
-        frameCount = frameCount + 1
-        if clock() - fpsClock >= 0.5 then
-            fps = floor(frameCount / (clock() - fpsClock) + 0.5)
-            frameCount, fpsClock = 0, clock()
-        end
         if capturing then
             for _, code in ipairs(ALL_KEYS) do
                 if keyEdge(code) then
@@ -4897,7 +6841,9 @@ local function buildUI()
     })
 
     local mainTab = uiWindow:AddTab("Main", "user")
+    local aimTab = uiWindow:AddTab("Aim", "crosshair")
     local visTab = uiWindow:AddTab("Visuals", "eye")
+    local hudTab = uiWindow:AddTab("HUD", "list")
     local setTab = uiWindow:AddTab("Settings", "settings")
 
     local scGroup = mainTab:AddGroupbox({ Side = "Left", Name = "Skillcheck", Description = "generators + butcher trap" })
@@ -4963,6 +6909,99 @@ local function buildUI()
         end
     end)
 
+    local aimGroup = aimTab:AddGroupbox({ Side = "Left", Name = "Veil Spear", Description = "killer throw assist" })
+    local aimToggle = aimGroup:AddToggle("va_enabled", {
+        Text = "Auto aim",
+        Default = CFG.va,
+        Callback = function(on)
+            CFG.va = on and true or false
+            if not CFG.va then
+                vaStat.target, vaStat.solved, vaStat.state = nil, false, "Disabled"
+            end
+            if UI then UI:Notify("Auto aim  [ " .. (CFG.va and "ON" or "OFF") .. " ]", 2, "Swangy") end
+        end,
+    })
+    aimToggle:AddKeyPicker("va_key", { Text = "Aim key", Mode = "Toggle" })
+
+    aimGroup:AddSlider("va_fov", {
+        Text = "Field of view", Default = CFG.vaFov,
+        Min = 5, Max = 180, Rounding = 1, Suffix = " deg",
+        Callback = function(v) CFG.vaFov = v end,
+    })
+    aimGroup:AddSlider("va_range", {
+        Text = "Range", Default = CFG.vaRange,
+        Min = 20, Max = 600, Rounding = 1, Suffix = " studs",
+        Callback = function(v) CFG.vaRange = v end,
+    })
+    aimGroup:AddSlider("va_smooth", {
+        Text = "Smoothing", Default = CFG.vaSmooth,
+        Min = 1, Max = 20, Rounding = 1,
+        Callback = function(v) CFG.vaSmooth = v end,
+    })
+    aimGroup:AddSlider("va_height", {
+        Text = "Aim height", Default = CFG.vaAimHeight,
+        Min = -4, Max = 8, Rounding = 1, Suffix = " studs",
+        Callback = function(v) CFG.vaAimHeight = v end,
+    })
+
+    aimGroup:AddToggle("va_sticky", {
+        Text = "Sticky target", Default = CFG.vaSticky,
+        Callback = function(on) CFG.vaSticky = on and true or false end,
+    })
+    aimGroup:AddToggle("va_lead", {
+        Text = "Lead moving targets", Default = CFG.vaLead,
+        Callback = function(on) CFG.vaLead = on and true or false end,
+    })
+    aimGroup:AddToggle("va_los", {
+        Text = "Line of sight", Default = CFG.vaLos,
+        Callback = function(on) CFG.vaLos = on and true or false end,
+    })
+    aimGroup:AddToggle("va_hold", {
+        Text = "Only while charging", Default = CFG.vaHold,
+        Callback = function(on) CFG.vaHold = on and true or false end,
+    })
+    aimGroup:AddLabel({
+        Text = "Click the key box to bind. Right-click it for Hold / Toggle / Always. Escape clears it.",
+        DoesWrap = true,
+    })
+
+    local aimStatusGroup = aimTab:AddGroupbox({ Side = "Right", Name = "Status" })
+    local aimStateLabel = aimStatusGroup:AddLabel({ Text = "Disabled", DoesWrap = true })
+    local aimTargetLabel = aimStatusGroup:AddLabel({ Text = "target --", DoesWrap = true })
+    local aimShotLabel = aimStatusGroup:AddLabel({ Text = "hold 0.00s", DoesWrap = true })
+    aimStatusGroup:AddDivider("Aim")
+    local aimLosLabel = aimStatusGroup:AddLabel({ Text = "line of sight: --", DoesWrap = true })
+    aimStatusGroup:AddLabel({
+        Text = "The aim only steers where the spear leaves. The throw itself is a normal client input.",
+        DoesWrap = true,
+    })
+
+    task.spawn(function()
+        while running and UI do
+            if aimStateLabel then aimStateLabel:SetText(tostring(vaStat.state or "--")) end
+            if aimTargetLabel then
+                aimTargetLabel:SetText(vaStat.target
+                    and string.format("%s  %.0f studs", tostring(vaStat.target), vaStat.dist or 0)
+                    or "no target")
+            end
+            if aimShotLabel then
+                if vaStat.solved then
+                    aimShotLabel:SetText(string.format("%.0f u/s  flight %.2fs  hold %.2fs  %s",
+                        vaStat.speed or 0, vaStat.flight or 0, vaStat.hold or 0, tostring(vaStat.tier or "--")))
+                else
+                    aimShotLabel:SetText(string.format("hold %.2fs  %s",
+                        vaStat.hold or 0, tostring(vaStat.tier or "--")))
+                end
+            end
+            if aimLosLabel then
+                aimLosLabel:SetText(vaStat.losOK == false
+                    and "line of sight: unavailable (raycast stub)"
+                    or "line of sight: available")
+            end
+            task.wait(0.2)
+        end
+    end)
+
     local espGroup = visTab:AddGroupbox({ Side = "Left", Name = "ESP", Description = "boxes and nametags" })
 
     espGroup:AddToggle("esp_gen", {
@@ -4991,6 +7030,20 @@ local function buildUI()
         Callback = function(c) CFG.palColour = c end,
     })
 
+    local trapToggle = espGroup:AddToggle("esp_trap", {
+        Text = "Bear trap ESP",
+        Default = CFG.trap,
+        Callback = function(on) API.trap.SetEnabled(on) end,
+    })
+    trapToggle:AddColorPicker("esp_trap_armed", {
+        Title = "Trap armed colour", Default = CFG.trapArmedColour,
+        Callback = function(c) CFG.trapArmedColour = c end,
+    })
+    trapToggle:AddColorPicker("esp_trap_sprung", {
+        Title = "Trap sprung colour", Default = CFG.trapSprungColour,
+        Callback = function(c) CFG.trapSprungColour = c end,
+    })
+
     espGroup:AddToggle("esp_names", {
         Text = "Nametags",
         Default = CFG.names,
@@ -5005,7 +7058,7 @@ local function buildUI()
         Min = 0, Max = 10000, Rounding = 1, Suffix = " studs",
         Callback = function(v)
             CFG.espRange = v
-            CFG.genRange, CFG.winRange, CFG.palRange = v, v, v
+            CFG.genRange, CFG.winRange, CFG.palRange, CFG.trapRange = v, v, v, v
         end,
     })
 
@@ -5028,6 +7081,80 @@ local function buildUI()
         DoesWrap = true,
     })
 
+    local hudGroup = hudTab:AddGroupbox({ Side = "Left", Name = "Killer HUD", Description = "attributes, gens, survivors" })
+    local hudBoot = true
+    local hudToggle = hudGroup:AddToggle("hud_enabled", {
+        Text = "HUD window",
+        Default = CFG.hud,
+        Callback = function(on)
+            CFG.hud = on and true or false
+            if not CFG.hud then pcall(HUD.hide) end
+            if not hudBoot and UI then UI:Notify("HUD  [ " .. (CFG.hud and "ON" or "OFF") .. " ]", 2, "Swangy") end
+        end,
+    })
+    hudBoot = false
+    HUD.toggleEl = hudToggle
+    hudToggle:AddKeyPicker("hud_key", { Text = "HUD key", Mode = "Toggle" })
+
+    hudGroup:AddToggle("hud_abilities", {
+        Text = "Killer abilities", Default = CFG.hudAbilities,
+        Callback = function(on) CFG.hudAbilities = on and true or false end,
+    })
+    hudGroup:AddToggle("hud_perks", {
+        Text = "Killer perks", Default = CFG.hudPerks,
+        Callback = function(on) CFG.hudPerks = on and true or false end,
+    })
+    hudGroup:AddToggle("hud_state", {
+        Text = "Killer state lines", Default = CFG.hudState,
+        Callback = function(on) CFG.hudState = on and true or false end,
+    })
+    hudGroup:AddToggle("hud_gens", {
+        Text = "Generator column", Default = CFG.hudGens,
+        Callback = function(on) CFG.hudGens = on and true or false end,
+    })
+    hudGroup:AddToggle("hud_survivors", {
+        Text = "Survivor list", Default = CFG.hudSurvivors,
+        Callback = function(on) CFG.hudSurvivors = on and true or false end,
+    })
+    hudGroup:AddToggle("hud_traps", {
+        Text = "Bear trap list", Default = CFG.hudTraps,
+        Callback = function(on) CFG.hudTraps = on and true or false end,
+    })
+    hudGroup:AddSlider("hud_alpha", {
+        Text = "HUD transparency", Default = CFG.hudAlpha,
+        Min = 0, Max = 100, Rounding = 1, Suffix = "%",
+        Callback = function(v) CFG.hudAlpha = v end,
+    })
+    hudGroup:AddLabel({
+        Text = "Transparency fades only the panel; the text stays. Drag anywhere, x or right-click closes.",
+        DoesWrap = true,
+    })
+
+    local hudStatusGroup = hudTab:AddGroupbox({ Side = "Right", Name = "Status" })
+    local hudKillerLabel = hudStatusGroup:AddLabel({ Text = "killer --", DoesWrap = true })
+    local hudCountLabel = hudStatusGroup:AddLabel({ Text = "lines 0  gens 0  survivors 0", DoesWrap = true })
+    hudStatusGroup:AddDivider("Window")
+    hudStatusGroup:AddLabel({
+        Text = "Survivors only lists while you are the killer. The panel is independent of this menu.",
+        DoesWrap = true,
+    })
+
+    task.spawn(function()
+        while running and UI do
+            if hudKillerLabel then
+                local K = HUD.k
+                hudKillerLabel:SetText((K and K.char)
+                    and ("killer " .. tostring(K.type or "?") .. "  " .. tostring(K.player and K.player.Name or ""))
+                    or "killer --")
+            end
+            if hudCountLabel then
+                hudCountLabel:SetText(string.format("lines %d  gens %d  traps %d  survivors %d",
+                    HUD.count or 0, #genList, #trapList, #HUD.surv))
+            end
+            task.wait(0.4)
+        end
+    end)
+
     local menuGroup = setTab:AddGroupbox({ Side = "Left", Name = "Menu" })
     menuGroup:AddKeyPicker("menu_key", {
         Text = "Menu key", Default = "RightShift", CaptureOnly = true,
@@ -5040,6 +7167,10 @@ local function buildUI()
     menuGroup:AddToggle("menu_watermark", {
         Text = "Watermark", Default = true,
         Callback = function(on) UI:SetWatermark(on) end,
+    })
+    menuGroup:AddToggle("kbw_show", {
+        Text = "Keybind window", Default = CFG.kbw,
+        Callback = function(on) CFG.kbw = on and true or false end,
     })
     menuGroup:AddButton({ Text = "Unload everything", Func = function() API.unload() end })
     menuGroup:AddDivider("Credits")
@@ -5068,7 +7199,7 @@ API.ui = UI
 refreshWorld()
 refreshPallets()
 if type(notify) == "function" then
-    notify("gen / window / pallet ESP + skillcheck", "Swangy", 4)
+    notify("esp + skillcheck + veil aim", "Swangy", 4)
 end
 
 _G.__SWANGY = API
