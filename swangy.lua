@@ -7,11 +7,96 @@
 
 if _G.__SWANGY and _G.__SWANGY.unload then pcall(_G.__SWANGY.unload) end
 
-local Players    = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local Workspace  = game:GetService("Workspace")
-local lp         = Players.LocalPlayer
-local mouse      = lp:GetMouse()
+-- game:GetService can return nil in this VM - MEASURED 2026-10-29: all
+-- three services nil in the same second that the global `workspace` was
+-- fine. Every service is fetched with retries, Workspace falls back to the
+-- global, and a missing one waits for the game instead of dying (that was
+-- the Matcha:13 "LocalPlayer" error that needed a rejoin).
+local function swangyService(name)
+    for _ = 1, 6 do
+        local ok, s = pcall(function() return game:GetService(name) end)
+        if ok and s then return s end
+    end
+    local ok2, s2 = pcall(function() return game:FindFirstChild(name) end)
+    if ok2 and s2 then return s2 end
+    -- GetService also returns nil for RunService and Players in this VM, but
+    -- the services are still children of the DataModel: game:GetChildren()
+    -- lists Players and RunService. Match on ClassName because some names
+    -- read as empty strings.
+    local okK, kids = pcall(function() return game:GetChildren() end)
+    if okK and type(kids) == "table" then
+        for i = 1, #kids do
+            local cls, nm = nil, nil
+            pcall(function() cls = kids[i].ClassName end)
+            pcall(function() nm = kids[i].Name end)
+            if cls == name or nm == name then return kids[i] end
+        end
+    end
+    return nil
+end
+
+local Players, RunService, Workspace = nil, nil, nil
+local lp, mouse = nil, nil
+
+-- every load takes a generation token, not just a load that waits: an older
+-- waiter used to survive a reload, finish later and build a second hub
+local loadToken = {}
+_G.__SWANGY_LOAD = loadToken
+
+local function resolveCore()
+    Players = Players or swangyService("Players")
+    RunService = RunService or swangyService("RunService")
+    if not Workspace then
+        pcall(function() Workspace = workspace end)
+        if not Workspace then Workspace = swangyService("Workspace") end
+    end
+    if not lp then
+        -- three routes: the cached service, a fresh one, and the datamodel
+        -- property. A stale Players wrapper was one of the ways this ended
+        -- in "index nil with LocalPlayer".
+        if Players then pcall(function() lp = Players.LocalPlayer end) end
+        if not lp then pcall(function() lp = game:GetService("Players").LocalPlayer end) end
+        if not lp then pcall(function() lp = game.Players.LocalPlayer end) end
+    end
+    return Players ~= nil and RunService ~= nil and Workspace ~= nil and lp ~= nil
+end
+
+-- Measured: right after the game attaches this VM reports every service as
+-- nil (and Players.LocalPlayer as nil) for a second or two. Returning here
+-- was the "Matcha:13 attempt to index nil with 'LocalPlayer'" / "rejoin to
+-- fix" path. Wait for the game instead; a newer load cancels the wait.
+if not resolveCore() then
+    -- a loaded chunk cannot yield at its top level in this VM, so blocking
+    -- here dies silently and leaves you reloading by hand. Queue a retry
+    -- instead; it re-runs the file once the game is readable.
+    print("[swangy] game not attached yet - queued, it will start by itself")
+    task.spawn(function()
+        while _G.__SWANGY_LOAD == loadToken do
+            if resolveCore() then
+                local src
+                if type(readfile) == "function" then
+                    local okr, s = pcall(readfile, "swangy.lua")
+                    if okr then src = s end
+                end
+                if type(src) == "string" and #src > 100 then
+                    local fn, cerr = loadstring(src, "swangy.lua")
+                    if fn then
+                        local ok, rerr = pcall(fn)
+                        if not ok then print("[swangy] deferred load failed: " .. tostring(rerr)) end
+                    else
+                        print("[swangy] deferred compile failed: " .. tostring(cerr))
+                    end
+                else
+                    print("[swangy] deferred load: swangy.lua unreadable")
+                end
+                return
+            end
+            task.wait(0.5)
+        end
+    end)
+    return
+end
+pcall(function() mouse = lp:GetMouse() end)
 
 -- config
 local CFG = {
@@ -61,7 +146,18 @@ local CFG = {
     trapArmedColour  = Color3.fromRGB(80, 255, 120),
     trapSprungColour = Color3.fromRGB(255, 60, 60),
 
+    pump          = true,
+    pumpRange     = 1000,
+    pumpPool      = 32,
+    pumpText      = 12,
+    pumpFill      = true,
+    pumpFillA     = 0.20,
+    pumpThick     = 1.6,
+    pumpColour    = Color3.fromRGB(255, 150, 40),
+    pumpScanHz    = 0.25,   -- GetDescendants on the map is expensive
+
     names     = true,
+    namesOnly = false,   -- draw labels without the boxes
     espRange  = 1000,
 
     sc        = true,
@@ -72,7 +168,7 @@ local CFG = {
     scHumMax  = 50,
     scReact   = 0,
     scDelay   = 0,
-    scHz      = 240,
+    scHz      = 120,   -- 120 Hz still lands a skillcheck within 8 ms, half the wakeups
     scRescue  = true,
     scDry     = false,
     scMode    = nil,
@@ -86,6 +182,21 @@ local CFG = {
     vaLos     = true,
     vaHold    = true,
     vaAimHeight = 0,
+
+    pp           = true,
+    ppRange      = 14,
+    ppMinRange   = 13,
+    ppPing       = true,
+    ppFacing     = true,
+    ppAim        = true,
+    ppHealth     = 50,
+    ppInterval   = 0.45,
+    ppEquip      = true,
+    ppEquipRange = 45,
+    ppWindup     = true,
+    ppWindupHz   = 120,
+    ppScanRange  = 70,
+    ppHz         = 120,
 
     kbw       = true,
 
@@ -176,6 +287,31 @@ local function hideSlot(e)
     end
     if e.top.Visible then e.top.Visible = false end
     if e.sub.Visible then e.sub.Visible = false end
+end
+
+-- slots are built on first use: the old load created every pool up front
+-- (104 slots = 2,080 Drawing objects) before a single target existed, which
+-- is what made loading and reloading the executor heavy
+local function ensureSlots(pool, count, thick, text)
+    -- called from the collectors, never from the render callback: creating a
+    -- Drawing while the renderer is running is what the executor docs warn about
+    for i = 1, count do
+        if not pool[i] then pool[i] = newSlot(thick, text) end
+    end
+end
+
+-- names-only mode: keep the label, drop the box and its fill
+local function hideBox(e)
+    if not e then return end
+    for i = 1, 12 do
+        if e.lines[i].Visible then
+            e.lvis[i] = false
+            e.lines[i].Visible = false
+        end
+    end
+    for i = 1, 6 do
+        if e.tris[i].Visible then e.tris[i].Visible = false end
+    end
 end
 
 local function convexHull(pts)
@@ -355,7 +491,7 @@ local function lower(s) return string.lower(tostring(s)) end
 local genPool, genList, genGeo, genStamp = {}, {}, {}, nil
 local genShown = 0
 
-for i = 1, CFG.genPool do genPool[i] = newSlot(CFG.genThick, CFG.genText) end
+
 
 -- generators
 local GEN_SKIP = { "hitbox", "point", "anchor", "handle", "invis" }
@@ -394,7 +530,7 @@ end
 
 local function firstPart(model)
     local ok, kids = pcall(function() return model:GetChildren() end)
-    if not ok then return nil end
+    if not ok or type(kids) ~= "table" then return nil end
     for _, c in ipairs(kids) do
         if isPart(c) then return c end
     end
@@ -461,8 +597,9 @@ local function collectGens()
 
     local folder
     local okKids, kids = pcall(function() return map:GetChildren() end)
+    if not okKids or type(kids) ~= "table" then okKids, kids = false, {} end
 
-    local parents = { okKids and kids or {} }
+    local parents = { kids }
     local okRes, res = pcall(function() return map:FindFirstChild("resources") end)
     if okRes and res then
         local okSub, sub = pcall(function() return res:GetChildren() end)
@@ -476,7 +613,7 @@ local function collectGens()
             if ch.ClassName == "Folder"
                 and (n:find("generator", 1, true) or n:find("gens", 1, true)) then
                 local okSub, sub = pcall(function() return ch:GetChildren() end)
-                if okSub and #sub > 0 then folder = ch break end
+                if okSub and type(sub) == "table" and #sub > 0 then folder = ch break end
             end
         end
     end
@@ -560,18 +697,25 @@ end
 local function drawGens(camPos, now)
     local n = 0
     for i = 1, #genList do
-        if n >= #genPool then break end
+        if n >= CFG.genPool then break end
         local t = genList[i]
         local d = (t.center - camPos).Magnitude
         if d <= CFG.genRange then
             n = n + 1
             local e = genPool[n]
+            if not e then n = n - 1 break end
             local colour = genColour(t.prog, t.state)
 
-            local okBox, topY = pcall(drawBox, e, t.center, t.hx, t.hy, t.hz,
-                t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
-                colour, CFG.genFill and CFG.genFillA or nil, CFG.genThick)
-            if not okBox then topY = nil end
+            local topY
+            if CFG.namesOnly then
+                hideBox(e)
+            else
+                local okBox
+                okBox, topY = pcall(drawBox, e, t.center, t.hx, t.hy, t.hz,
+                    t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
+                    colour, CFG.genFill and CFG.genFillA or nil, CFG.genThick)
+                if not okBox then topY = nil end
+            end
 
             local top, okT = WorldToScreen(t.center + Vector3.new(0, t.hy, 0))
             local bot, okB = WorldToScreen(t.center - Vector3.new(0, t.hy, 0))
@@ -620,19 +764,24 @@ local function drawGens(camPos, now)
 end
 
 local winPool, winList, winGeo = {}, {}, {}
-for i = 1, CFG.winPool do winPool[i] = newSlot(CFG.winThick, CFG.winText) end
+
 
 -- windows
 local function collectWindows()
     local out = {}
     local map = Workspace:FindFirstChild("Map")
-    if not map then return out end
+    -- nil means "could not scan" so the caller keeps what it already has;
+    -- an empty table means the map genuinely has no windows
+    if not map then return nil end
     local ok, desc = pcall(function() return map:GetDescendants() end)
-    if not ok or type(desc) ~= "table" then return out end
+    if not ok or type(desc) ~= "table" then return nil end
 
     local candidates = {}
     for _, d in ipairs(desc) do
         if lower(d.Name):find("window", 1, true) then
+            -- a window that is itself a part has no descendants to collect,
+            -- so take it directly instead of silently skipping it
+            if isPart(d) then candidates[#candidates + 1] = d end
             local okKids, kids = pcall(function() return d:GetDescendants() end)
             if okKids and type(kids) == "table" then
                 for _, k in ipairs(kids) do
@@ -681,17 +830,23 @@ local winShown = 0
 local function drawWindows(camPos)
     local n = 0
     for i = 1, #winList do
-        if n >= #winPool then break end
+        if n >= CFG.winPool then break end
         local t = winList[i]
         if t.pos and t.size then
             local d = (t.pos - camPos).Magnitude
             if d <= CFG.winRange then
                 n = n + 1
                 local e = winPool[n]
-                local topY = drawBox(e, t.pos,
-                    t.size.X * 0.5, t.size.Y * 0.5, t.size.Z * 0.5,
-                    t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
-                    CFG.winColour, CFG.winFill and CFG.winFillA or nil, CFG.winThick)
+                if not e then n = n - 1 break end
+                local topY
+                if CFG.namesOnly then
+                    hideBox(e)
+                else
+                    topY = drawBox(e, t.pos,
+                        t.size.X * 0.5, t.size.Y * 0.5, t.size.Z * 0.5,
+                        t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
+                        CFG.winColour, CFG.winFill and CFG.winFillA or nil, CFG.winThick)
+                end
                 local top, okTop = WorldToScreen(t.anchor or t.pos)
                 if okTop and top and CFG.names then
                     local di = math.floor(d + 0.5)
@@ -721,7 +876,7 @@ end
 
 local palPool, palList = {}, {}
 local palShown = 0
-for i = 1, CFG.palPool do palPool[i] = newSlot(CFG.palThick, CFG.palText) end
+
 
 local palIndex, palFolder, palFolderMap, palMisses = {}, nil, nil, 0
 
@@ -883,20 +1038,26 @@ end
 
 local function drawPallets(camPos)
     local last = #palList
-    if last > #palPool then last = #palPool end
+    if last > CFG.palPool then last = CFG.palPool end
 
     for i = 1, last do
         local t = palList[i]
         local e = palPool[i]
+        if not e then break end
         local d = (t.pos - camPos).Magnitude
         if d <= CFG.palRange and t.size and t.cf then
 
             local colour = t.dropped
                 and lerpColor(CFG.palColour, CFG.palDownColour, 0.55)
                 or CFG.palColour
-            local topY = drawBox(e, t.pos, t.size.X * 0.5, t.size.Y * 0.5, t.size.Z * 0.5,
-                t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
-                colour, CFG.palFill and CFG.palFillA or nil, CFG.palThick)
+            local topY
+            if CFG.namesOnly then
+                hideBox(e)
+            else
+                topY = drawBox(e, t.pos, t.size.X * 0.5, t.size.Y * 0.5, t.size.Z * 0.5,
+                    t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
+                    colour, CFG.palFill and CFG.palFillA or nil, CFG.palThick)
+            end
             local top, okTop = WorldToScreen(t.pos + Vector3.new(0, t.size.Y * 0.5 + 1.2, 0))
             if okTop and top and CFG.names then
                 local text = string.format("%s   %dm",
@@ -922,7 +1083,7 @@ end
 
 local trapPool, trapList = {}, {}
 local trapShown = 0
-for i = 1, CFG.trapPool do trapPool[i] = newSlot(CFG.trapThick, CFG.trapText) end
+
 
 -- bear traps
 local trapIndex, trapTrapped, trapVictimAt = {}, {}, 0
@@ -985,7 +1146,9 @@ end
 
 local function trapRoots(map)
     local out = {}
-    for _, ch in ipairs(map:GetChildren()) do
+    local okKids, kids = pcall(function() return map:GetChildren() end)
+    if not okKids or type(kids) ~= "table" then kids = {} end
+    for _, ch in ipairs(kids) do
         local n = lower(ch.Name)
         if n == "beartrap" or n == "beartraps" then out[#out + 1] = ch end
     end
@@ -1105,16 +1268,22 @@ end
 local function drawTraps(camPos)
     local n = 0
     for i = 1, #trapList do
-        if n >= #trapPool then break end
+        if n >= CFG.trapPool then break end
         local t = trapList[i]
         local d = (t.pos - camPos).Magnitude
         if d <= CFG.trapRange then
             n = n + 1
             local e = trapPool[n]
+            if not e then n = n - 1 break end
             local colour = (t.armed == false) and CFG.trapSprungColour or CFG.trapArmedColour
-            local topY = drawBox(e, t.pos, t.hx, t.hy, t.hz,
-                t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
-                colour, CFG.trapFill and CFG.trapFillA or nil, CFG.trapThick)
+            local topY
+            if CFG.namesOnly then
+                hideBox(e)
+            else
+                topY = drawBox(e, t.pos, t.hx, t.hy, t.hz,
+                    t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
+                    colour, CFG.trapFill and CFG.trapFillA or nil, CFG.trapThick)
+            end
             local top, okTop = WorldToScreen(t.pos + Vector3.new(0, t.hy + 1.2, 0))
             if okTop and top and CFG.names then
                 local text = string.format("BEAR TRAP  %dm", math.floor(d + 0.5))
@@ -1129,14 +1298,271 @@ local function drawTraps(camPos)
             elseif e.top.Visible then
                 e.top.Visible = false
             end
-        else
-            hideSlot(e)
         end
+        -- out of range: nothing is drawn for it, and the slots below n belong
+        -- to other traps. The tail loop after this hides what is left over.
     end
     if trapShown > n then
         for i = n + 1, trapShown do hideSlot(trapPool[i]) end
     end
     trapShown = n
+    return n
+end
+
+-- pumpkins
+local pumpPool, pumpList = {}, {}
+local pumpShown = 0
+
+local pumpIndex = {}
+local pumpDeepAt = 0
+local pumpMapAddr = nil
+
+local PUMP_WORDS = { "pumpkin", "jackolantern" }
+
+local function pumpkinish(name)
+    local n = lower(tostring(name)):gsub("[%s_%-]", "")
+    for i = 1, #PUMP_WORDS do
+        if n:find(PUMP_WORDS[i], 1, true) then return true end
+    end
+    return false
+end
+
+-- Name reads on a stale wrapper throw in this VM; one bad instance must not
+-- abort the whole scan.
+local function instName(inst)
+    local n
+    pcall(function() n = inst.Name end)
+    return n
+end
+
+-- geometry: the model's `shell` is the visible pumpkin, `HB` is its
+-- invisible hitbox, and older props are just a part. Fall back to the
+-- largest part in the model, then to nested models, like the working
+-- standalone did.
+local function pumpkinPartOf(inst, depth)
+    if not inst then return nil end
+    if isPart(inst) then return inst end
+    local shell, hb
+    pcall(function() shell = inst:FindFirstChild("shell") end)
+    if shell and isPart(shell) then return shell end
+    pcall(function() hb = inst:FindFirstChild("HB") end)
+    if hb and isPart(hb) then return hb end
+    local ok, kids = pcall(function() return inst:GetChildren() end)
+    if not ok or type(kids) ~= "table" then return nil end
+    local best, bestVol = nil, -1
+    for _, c in ipairs(kids) do
+        if isPart(c) then
+            local oks, s = pcall(function() return c.Size end)
+            if oks and s then
+                local vol = s.X * s.Y * s.Z
+                if vol > bestVol then bestVol, best = vol, c end
+            end
+        end
+    end
+    if best then return best end
+    depth = depth or 0
+    if depth >= 2 then return nil end
+    for _, c in ipairs(kids) do
+        local cn = c.ClassName
+        if cn == "Model" or cn == "Folder" then
+            local p = pumpkinPartOf(c, depth + 1)
+            if p then return p end
+        end
+    end
+    return nil
+end
+
+local function pumpkinSubject(inst)
+    if isPart(inst) then
+        return pumpkinish(instName(inst)) and inst or nil
+    end
+    local shell, hb
+    pcall(function() shell = inst:FindFirstChild("shell") end)
+    pcall(function() hb = inst:FindFirstChild("HB") end)
+    if shell and isPart(shell) then
+        -- collected pumpkins go transparent; drop them
+        local gone = false
+        pcall(function()
+            local tr = shell.Transparency
+            if type(tr) == "number" and tr >= 0.9 then gone = true end
+        end)
+        if gone then return nil end
+        return shell, hb
+    end
+    if hb and isPart(hb) then
+        if pumpkinish(instName(inst)) then return pumpkinPartOf(inst) or hb, hb end
+        return hb, hb
+    end
+    if pumpkinish(instName(inst)) then return pumpkinPartOf(inst) end
+    return nil
+end
+
+local pumpChar
+local function underCharacter(part)
+    if not pumpChar and lp then pcall(function() pumpChar = lp.Character end) end
+    if not pumpChar then return false end
+    local ok, v = pcall(function() return part:IsDescendantOf(pumpChar) end)
+    return ok and v == true
+end
+
+-- discovery order, from the working standalone: dedicated folders first,
+-- then any pumpkin-named model/part two or three levels under Map and
+-- Lobby, then a full Workspace sweep when that finds nothing.
+local function collectPumpkins()
+    -- carry over props the deep sweep found but the fast walk does not reach,
+    -- so a deeply nested pumpkin does not blink out between sweeps
+    local out, nextIndex, seen, seenIds = {}, {}, {}, {}
+    for id, e in pairs(pumpIndex) do
+        local alive = false
+        if e.part and e.model then
+            pcall(function()
+                if e.part.Parent == nil or e.model.Parent == nil then return end
+                if not e.part:IsDescendantOf(Workspace) then return end
+                local tr = e.part.Transparency
+                if type(tr) == "number" and tr >= 0.9 then return end
+                alive = true
+            end)
+        end
+        if alive then
+            out[#out + 1] = e
+            nextIndex[id] = e
+            seenIds[id] = true
+        end
+    end
+
+    local function add(inst)
+        if not inst or seen[inst] then return end
+        seen[inst] = true
+        local subject, hb = pumpkinSubject(inst)
+        if not subject or underCharacter(subject) then return end
+        local okT, tr = pcall(function() return subject.Transparency end)
+        if okT and type(tr) == "number" and tr >= 0.95 then return end
+        local id = trapAddress(subject)
+        if id and seenIds[id] then return end
+        if id then seenIds[id] = true end
+        local entry = id and pumpIndex[id] or nil
+        if not entry then
+            local center, hx, hy, hz, right, up, back = trapMeasure(subject)
+            if not center then return end
+            if hb and isPart(hb) then
+                local okp, hp = pcall(function() return hb.Position end)
+                if okp and hp then center = hp end
+            end
+            entry = { pos = center, hx = hx, hy = hy, hz = hz,
+                      right = right, up = up, back = back }
+        end
+        entry.model, entry.part = inst, subject
+        if id then nextIndex[id] = entry end
+        out[#out + 1] = entry
+    end
+
+    local function fromFolder(folder)
+        if not folder then return end
+        local ok, kids = pcall(function() return folder:GetChildren() end)
+        if not ok or type(kids) ~= "table" then return end
+        for _, child in ipairs(kids) do add(child) end
+    end
+
+    local function walk(container, depth, maxDepth)
+        if not container then return end
+        local ok, kids = pcall(function() return container:GetChildren() end)
+        if not ok or type(kids) ~= "table" then return end
+        for _, inst in ipairs(kids) do
+            local cls = inst.ClassName
+            local named = pumpkinish(instName(inst))
+            if isPart(inst) then
+                if named then add(inst) end
+            elseif cls == "Model" and named then
+                add(inst)
+            elseif (cls == "Model" or cls == "Folder") and depth < maxDepth then
+                walk(inst, depth + 1, maxDepth)
+            end
+            if #out >= CFG.pumpPool then return end
+        end
+    end
+
+    local map = Workspace:FindFirstChild("Map")
+    local mapAddr
+    if map then pcall(function() mapAddr = map.Address end) end
+    if mapAddr and pumpMapAddr and mapAddr ~= pumpMapAddr then
+        -- a different map instance means a new round; nothing cached applies
+        pumpIndex = {}
+        pumpDeepAt = 0
+        out, nextIndex, seen, seenIds = {}, {}, {}, {}
+    end
+    if mapAddr then pumpMapAddr = mapAddr end
+    fromFolder(map and map:FindFirstChild("Pumpkins"))
+    fromFolder(Workspace:FindFirstChild("Pumpkins"))
+
+    walk(map, 1, 2)
+    walk(Workspace:FindFirstChild("Lobby"), 1, 2)
+
+    if #out == 0 then
+        -- the event folder is not always named; it holds shell/HB models
+        fromFolder(Workspace:FindFirstChild("Interractables"))
+    end
+
+    -- the reference scanned the whole Workspace every 3 s; 12 s is enough for
+    -- props that never move, and the first scan always sweeps.
+    local now = os.clock()
+    if now >= pumpDeepAt then
+        -- an empty scan used to ignore pumpDeepAt entirely, so a map with no
+        -- pumpkins ran a full Workspace:GetDescendants every 4 s. Retry sooner
+        -- when nothing is found, but never on every collector tick.
+        pumpDeepAt = now + (#out == 0 and 8 or 12)
+        local ok, desc = pcall(function() return Workspace:GetDescendants() end)
+        if ok and type(desc) == "table" then
+            for _, inst in ipairs(desc) do
+                if pumpkinish(instName(inst)) then
+                    local cls = inst.ClassName
+                    if isPart(inst) or cls == "Model" or cls == "Folder" then
+                        add(inst)
+                    end
+                end
+                if #out >= CFG.pumpPool then break end
+            end
+        end
+    end
+
+    pumpIndex = nextIndex
+    return out
+end
+
+local function drawPumpkins(camPos)
+    local n = 0
+    for i = 1, #pumpList do
+        if n >= CFG.pumpPool then break end
+        local t = pumpList[i]
+        local d = (t.pos - camPos).Magnitude
+        if d <= CFG.pumpRange then
+            n = n + 1
+            local e = pumpPool[n]
+            if not e then n = n - 1 break end
+            local topY
+            if CFG.namesOnly then
+                hideBox(e)
+            else
+                topY = drawBox(e, t.pos, t.hx, t.hy, t.hz,
+                    t.right or R_AXIS, t.up or U_AXIS, t.back or B_AXIS,
+                    CFG.pumpColour, CFG.pumpFill and CFG.pumpFillA or nil, CFG.pumpThick)
+            end
+            local top, okTop = WorldToScreen(t.pos + Vector3.new(0, t.hy + 1.0, 0))
+            if okTop and top and CFG.names then
+                local text = string.format("PUMPKIN  %dm", math.floor(d + 0.5))
+                if e.lastTop ~= text then e.lastTop = text; e.top.Text = text end
+                if e.col ~= CFG.pumpColour then e.col = CFG.pumpColour; e.top.Color = CFG.pumpColour end
+                e.top.Position = Vector2.new(top.X,
+                    (topY and topY < 100000) and (topY - 16) or (top.Y - 16))
+                e.top.Visible = true
+            elseif e.top.Visible then
+                e.top.Visible = false
+            end
+        end
+    end
+    if pumpShown > n then
+        for i = n + 1, pumpShown do hideSlot(pumpPool[i]) end
+    end
+    pumpShown = n
     return n
 end
 
@@ -1216,6 +1642,7 @@ end
 
 local function scResetCheck()
     scTrack.fired, scTrack.rescued, scTrack.missed = false, false, false
+    scTrack.pending = nil
     scTrack.trace = {}
     scTrack.delay = scPlanDelay()
     scTrack.scheduled = false
@@ -1405,14 +1832,26 @@ local function scPressPlanned(why, angle)
         scDoPress(why)
         return
     end
-    local token = scPressToken
-    task.delay(wait, function()
-        if not CFG.sc then return end
-        if token ~= scPressToken then return end
-        if not scTrack.fired then return end
-        scStats.fireAt = angle
-        scDoPress(string.format("%s +%.0fms", why, wait * 1000))
-    end)
+    -- Matcha's task.delay never fires (it is a deadline, not a scheduler), so a
+    -- planned press is parked here and serviced by the scStep tick instead.
+    scTrack.pending = {
+        at = os.clock() + wait,
+        token = scPressToken,
+        angle = angle,
+        why = string.format("%s +%.0fms", why, wait * 1000),
+        check = function()
+            local inst = scGui.line
+            if not inst then return false end
+            local cur = scAngleRaw(inst, scGui.off)
+            if cur and scTrack.goal then
+                if (cur - scTrack.goal) > 161 then return false end
+                return true
+            end
+            -- no readable angle: press unless we can prove the prompt is gone
+            local okp, parent = pcall(function() return inst.Parent end)
+            return not (okp and parent == nil)
+        end,
+    }
 end
 
 local function scStep()
@@ -1447,6 +1886,19 @@ local function scStep()
         scInputAt = now + 0.5
         scInput = scInputFor(lp:GetAttribute("kb_skillcheck"), CFG.scKey)
         scStats.key = scInput and scInput.name or "--"
+    end
+
+    -- planned press: a deadline serviced here, because task.delay never fires
+    local pending = scTrack.pending
+    if pending and now >= pending.at then
+        scTrack.pending = nil
+        local keep = (pending.token == nil) or (pending.token == scPressToken)
+        if keep and pending.check then keep = pending.check() end
+        if keep then
+            if pending.angle then scStats.fireAt = pending.angle end
+            scDoPress(pending.why)
+            now = os.clock()   -- the press holds the key for ~20ms
+        end
     end
 
     if not scGui.line then
@@ -1585,19 +2037,22 @@ local function scStep()
                     local dt = (lo + 6 - phase) / scTrack.speed - (scTrack.delayUse or 0)
                     if dt > 0.002 and dt <= 2 then
                         scTrack.scheduled, scTrack.schedBase = true, scTrack.base
-                        task.delay(dt, function()
-                            if not CFG.sc then return end
-                            if scTrack.base == nil or scTrack.schedBase ~= scTrack.base then return end
-                            if scTrack.fired or scTrack.missed then return end
-                            local cur = scAngleRaw(scGui.line, scGui.off)
-                            if cur then
-                                local ph = cur - scTrack.base
-                                if ph < lo or ph > good then return end
-                                scStats.fireAt = cur
-                            end
-                            scTrack.fired = true
-                            scDoPress("trap timed")
-                        end)
+                        scTrack.pending = {
+                            at = os.clock() + dt, token = scPressToken,
+                            why = "trap timed",
+                            check = function()
+                                if scTrack.base == nil or scTrack.schedBase ~= scTrack.base then return false end
+                                if scTrack.fired or scTrack.missed then return false end
+                                local cur = scAngleRaw(scGui.line, scGui.off)
+                                if cur then
+                                    local ph = cur - scTrack.base
+                                    if ph < lo or ph > good then return false end
+                                    scStats.fireAt = cur
+                                end
+                                scTrack.fired = true
+                                return true
+                            end,
+                        }
                     end
                 end
             end
@@ -1620,10 +2075,23 @@ local function scStep()
             if gr ~= 0 then scStats.checks = scStats.checks + 1 end
             scResetCheck()
             scBusyUntil = math.max(scBusyUntil, now + 2.5)
+            scTrack.speed, scTrack.sampleAt = nil, nil
         end
         scTrack.lr, scTrack.goal = lr, gr
 
         scTrackSample(lr, d)
+
+        -- needle speed, so a humanized/planned delay can be taken off the trigger
+        if d ~= nil and math.abs(d) > 0.0005 then
+            local dt = now - (scTrack.sampleAt or (now - 0.016))
+            if dt > 0.002 and dt < 0.3 then
+                local sp = d / dt
+                if sp > 20 then
+                    scTrack.speed = scTrack.speed and (scTrack.speed * 0.6 + sp * 0.4) or sp
+                end
+            end
+            scTrack.sampleAt = now
+        end
 
         local lo, hi, neutral = gr + 102, gr + 116, gr + 159
         local leadAdj = math.clamp(tonumber(CFG.scLead) or 0, 0, (hi - lo) - 1)
@@ -1684,7 +2152,15 @@ local function refreshWorld()
 
     local started = os.clock()
     local map = Workspace:FindFirstChild("Map")
-    local stamp = map and (tostring(map.Address) .. ":" .. tostring(#map:GetChildren())) or "none"
+    local stamp = "none"
+    if map then
+        -- Address/GetChildren can throw in this VM; a dead stamp would stop
+        -- every world collector at once, so both reads are defensive
+        local addr, count = nil, nil
+        pcall(function() addr = map.Address end)
+        pcall(function() count = #map:GetChildren() end)
+        stamp = tostring(addr) .. ":" .. tostring(count)
+    end
     if stamp ~= genStamp then
         genStamp = stamp
         genGeo = {}
@@ -1723,6 +2199,7 @@ local function refreshWorld()
                 end
             end
         end
+        ensureSlots(genPool, math.min(#kept, CFG.genPool), CFG.genThick, CFG.genText)
         genList = kept
         if not kept[1] then genDiscoverAt = os.clock() + 1.5 end
     end
@@ -1732,8 +2209,16 @@ local function refreshWorld()
     else
         local t = os.clock()
         if stamp ~= winScanStamp or t >= winScanAt then
-            winScanStamp, winScanAt = stamp, t + 30
-            winList = collectWindows()
+            winScanStamp = stamp
+            local found = collectWindows()
+            if found then
+                winScanAt = t + 30
+                ensureSlots(winPool, math.min(#found, CFG.winPool), CFG.winThick, CFG.winText)
+                winList = found
+            else
+                -- one failed read used to wipe every window for the next 30s
+                winScanAt = t + 2
+            end
         end
     end
     worldMs = worldMs * 0.8 + (os.clock() - started) * 1000 * 0.2
@@ -1746,12 +2231,16 @@ local function refreshPallets()
     end
     local started = os.clock()
     local ok, list = pcall(collectPallets)
-    if ok and list then palList = list end
+    if ok and list then
+        ensureSlots(palPool, math.min(#list, CFG.palPool), CFG.palThick, CFG.palText)
+        palList = list
+    end
     palScanMs = palScanMs * 0.8 + (os.clock() - started) * 1000 * 0.2
 end
 
 connection = RunService.RenderStepped:Connect(function()
-    if not running then return end
+    -- a reload replaces __SWANGY_LOAD: a stale instance must stop drawing too
+    if not running or _G.__SWANGY_LOAD ~= loadToken then return end
     local now = os.clock()
     if CFG.drawHz > 0 and now - (CFG.lastFrame or 0) < 1 / CFG.drawHz then return end
     CFG.lastFrame = now
@@ -1761,7 +2250,9 @@ connection = RunService.RenderStepped:Connect(function()
         frameN, fpsMark = 0, now
     end
 
-    if not camera then camera = Workspace.CurrentCamera end
+    -- CurrentCamera is replaced on respawn and on a map swap; keeping the first
+    -- one left every box projecting through a dead camera until reload
+    camera = Workspace.CurrentCamera or camera
     if not camera then return end
     local okc, ccf = pcall(function() return camera.CFrame end)
     if not okc or not ccf then return end
@@ -1798,6 +2289,13 @@ connection = RunService.RenderStepped:Connect(function()
         for i = 1, trapShown do hideSlot(trapPool[i]) end
         trapShown = 0
     end
+    if CFG.pump then
+        local okpk, errpk = pcall(drawPumpkins, camPos)
+        CFG.errPump = (not okpk) and tostring(errpk) or nil
+    elseif pumpShown > 0 then
+        for i = 1, pumpShown do hideSlot(pumpPool[i]) end
+        pumpShown = 0
+    end
 
     renderMs = renderMs * 0.9 + (os.clock() - now) * 1000 * 0.1
 end)
@@ -1809,7 +2307,7 @@ task.spawn(function()
     end
 end)
 
-local genPollHz = 15
+local genPollHz = 10
 task.spawn(function()
     while running do
         if (CFG.gen or (CFG.hud and CFG.hudGens)) and genList[1] then pcall(updateGenStates, genList) end
@@ -1826,9 +2324,27 @@ end)
 
 task.spawn(function()
     while running do
+        if CFG.pump then
+            local ok, list = pcall(collectPumpkins)
+            if ok and list then
+                ensureSlots(pumpPool, math.min(#list, CFG.pumpPool), CFG.pumpThick, CFG.pumpText)
+                pumpList = list
+            end
+        elseif #pumpList > 0 then
+            pumpList = {}
+        end
+        task.wait(1 / CFG.pumpScanHz)
+    end
+end)
+
+task.spawn(function()
+    while running do
         if CFG.trap or (CFG.hud and CFG.hudTraps) then
             local ok, list = pcall(collectTraps)
-            if ok and list then trapList = list end
+            if ok and list then
+                ensureSlots(trapPool, math.min(#list, CFG.trapPool), CFG.trapThick, CFG.trapText)
+                trapList = list
+            end
             pcall(trapScanTrapped, os.clock())
         elseif #trapList > 0 then
             trapList = {}
@@ -1891,6 +2407,16 @@ end
 function API.trap.Toggle() return API.trap.SetEnabled(not CFG.trap) end
 function API.trap.SetRange(v) CFG.trapRange = math.max(1, tonumber(v) or CFG.trapRange) end
 function API.trap.GetCount() return #trapList end
+API.pumpkin = {}
+function API.pumpkin.SetEnabled(on)
+    CFG.pump = on and true or false
+    if not CFG.pump then pumpList = {} pumpShown = 0 end
+    return CFG.pump
+end
+function API.pumpkin.Toggle() return API.pumpkin.SetEnabled(not CFG.pump) end
+function API.pumpkin.SetRange(v) CFG.pumpRange = math.max(1, tonumber(v) or CFG.pumpRange) end
+function API.pumpkin.GetCount() return #pumpList end
+
 function API.trap.GetStates()
     local out = {}
     for i = 1, #trapList do
@@ -1919,7 +2445,11 @@ function API.sc.SetMode(mode)
     if mode == "gen" or mode == "trap" then CFG.scMode = mode else CFG.scMode = nil end
     return CFG.scMode
 end
-function API.sc.Stats() return scStats end
+function API.sc.Stats()
+    local p = scTrack.pending
+    scStats.pending = p and string.format("+%.0fms", math.max(0, (p.at - os.clock()) * 1000)) or nil
+    return scStats
+end
 
 function API.SetFill(gen, win, pal)
     if gen ~= nil then CFG.genFill = gen and true or false end
@@ -1935,7 +2465,8 @@ end
 
 function API.GetConfig()
     return {
-        gen = CFG.gen, win = CFG.win, pal = CFG.pal, trap = CFG.trap, names = CFG.names,
+        gen = CFG.gen, win = CFG.win, pal = CFG.pal, trap = CFG.trap, pump = CFG.pump,
+        names = CFG.names, namesOnly = CFG.namesOnly, errPump = CFG.errPump,
         range = CFG.genRange,
         winColour = CFG.winColour, palColour = CFG.palColour,
         trapArmedColour = CFG.trapArmedColour, trapSprungColour = CFG.trapSprungColour,
@@ -1986,7 +2517,8 @@ function API.unload()
     for i = 1, #winPool do removeSlot(winPool[i]) end
     for i = 1, #palPool do removeSlot(palPool[i]) end
     for i = 1, #trapPool do removeSlot(trapPool[i]) end
-    genPool, winPool, palPool, trapPool = {}, {}, {}, {}
+    for i = 1, #pumpPool do removeSlot(pumpPool[i]) end
+    genPool, winPool, palPool, trapPool, pumpPool = {}, {}, {}, {}, {}
     if _G.__SWANGY == API then _G.__SWANGY = nil end
 end
 API.stop = API.unload
@@ -2003,8 +2535,8 @@ local vaRot, vaRotFor, vaWarmAt = nil, nil, 0
 local function vaRotAddr()
     local cam = Workspace.CurrentCamera
     if not cam then return nil end
-    local base = cam.Address
-    if not base then return nil end
+    local okB, base = pcall(function() return cam.Address end)
+    if not okB or not base then return nil end
     if vaRotFor == base and vaRot then return vaRot end
 
     local now = os.clock()
@@ -2347,6 +2879,483 @@ task.spawn(function()
     end
 end)
 
+-- parry: replicated windup attributes -> simulated right click
+--
+-- Every value here was measured live in this game on 2026-10-29, and each
+-- one replaced something that did not work:
+--   * the swing is LowerBodyStabilize + AC_AllowedSpeed in 20..40. The band
+--     appears a poll BEFORE the stab flag, so the band alone is the trigger.
+--     ac=nil and ac=3.62 locks exist and are rejected by the band.
+--   * Players:GetPlayers and Players:GetChildren return empty mid-round, so
+--     killers are found in Workspace by attributes only a killer carries.
+--   * LocalPlayer's wrapper goes stale and CameraSubject is often a
+--     CameraBlock Part, so your character is found by attributes only the
+--     local client writes.
+--   * the client cooldown token caches stale addresses and blocked five real
+--     presses in a row, so it is not consulted at all. A press with the
+--     dagger down is refused by the game at no cost.
+--   * the press is mouse2click. No remote is ever sent.
+--   * the whole gate set is cached at 5 Hz: eleven GetAttribute reads on the
+--     press path measured as the reason a press landed too late.
+local PARRY = {
+    state = "Disabled", reason = nil, error = nil, denied = nil,
+    presses = 0, lands = 0, scans = 0,
+    lastPress = -100, lastCollect = 0, lastWindup = 0,
+    targets = {}, gate = { ok = false, reason = "starting", at = -1 },
+    charCache = nil, charAt = -1, rootCache = nil, rootAt = -1,
+}
+
+-- Attributes only a KILLER character carries. Stalking is deliberately out:
+-- a survivor was measured carrying Stalking=false.
+local PP_KILLER_ATTRS = {
+    "TerrorRadius", "ChaseTargetUserId", "BloodLust",
+    "MorphedKiller", "Butcher", "Beartraps",
+}
+-- Attributes written by scripts on YOUR client only. Verified against the
+-- killer and another survivor, whose lists contain none of them.
+local PP_SELF_ATTRS = {
+    "ParrySpent", "ParryLands", "Parry",
+    "RoundScriptsActive", "overridelookscript", "nogui",
+}
+
+PARRY.actions = { "action", "isVaulting", "isSliding", "isDroppingPallet",
+    "isRepairing", "isHealing", "isUnhooking", "isExiting" }
+PARRY.blocked = { "Knocked", "IsHooked", "IsCarried", "IsDead", "Trapped" }
+
+function PARRY.addr(inst)
+    if not inst then return nil end
+    local ok, a = pcall(function() return inst.Address end)
+    if ok and type(a) == "number" and a ~= 0 then return tostring(a) end
+    return tostring(inst)
+end
+
+function PARRY.same(a, b)
+    if not a or not b then return false end
+    local x, y = PARRY.addr(a), PARRY.addr(b)
+    if x and y and x == y then return true end
+    local n1, n2 = nil, nil
+    pcall(function() n1 = a.Name end)
+    pcall(function() n2 = b.Name end)
+    return n1 ~= nil and n1 == n2
+end
+
+-- Your character, without Players and without trusting the camera subject.
+function PARRY.myChar()
+    local now = os.clock()
+    if PARRY.charCache and now - PARRY.charAt < 0.5 and PARRY.charCache.Parent then
+        return PARRY.charCache
+    end
+    PARRY.charAt = now
+    local prev = PARRY.charCache
+    PARRY.charCache = nil
+
+    local cam = nil
+    pcall(function() cam = Workspace.CurrentCamera end)
+    if cam then
+        local subj = nil
+        pcall(function() subj = cam.CameraSubject end)
+        if subj then
+            local model = nil
+            pcall(function()
+                model = subj.Parent
+                if model and model.ClassName ~= "Model" then model = model.Parent end
+            end)
+            if model and model.ClassName == "Model" then PARRY.charCache = model end
+        end
+    end
+
+    if not PARRY.charCache and lp then
+        local okP, ch = pcall(function() return lp.Character end)
+        if okP and ch then PARRY.charCache = ch end
+    end
+
+    if not PARRY.charCache then
+        local ok, kids = pcall(function() return Workspace:GetChildren() end)
+        if ok and type(kids) == "table" then
+            local camPos = nil
+            pcall(function() camPos = Workspace.CurrentCamera.CFrame.Position end)
+            local best, bestD = nil, nil
+            for i = 1, #kids do
+                local m = kids[i]
+                if m.ClassName == "Model" then
+                    local hum = nil
+                    pcall(function() hum = m:FindFirstChildOfClass("Humanoid") end)
+                    if hum then
+                        local mine = false
+                        for j = 1, #PP_SELF_ATTRS do
+                            local v = nil
+                            pcall(function() v = m:GetAttribute(PP_SELF_ATTRS[j]) end)
+                            if v ~= nil then mine = true break end
+                        end
+                        if mine then
+                            PARRY.charCache = m
+                            break
+                        end
+                        local root = nil
+                        pcall(function() root = m:FindFirstChild("HumanoidRootPart") end)
+                        if root and camPos then
+                            local d = nil
+                            pcall(function() d = (root.Position - camPos).Magnitude end)
+                            if d and d < 6 and (not bestD or d < bestD) then best, bestD = m, d end
+                        end
+                    end
+                end
+            end
+            if not PARRY.charCache and best then PARRY.charCache = best end
+        end
+    end
+
+    if not PARRY.charCache and prev then
+        local alive = false
+        pcall(function() alive = prev.Parent ~= nil end)
+        if alive then PARRY.charCache = prev end
+    end
+    return PARRY.charCache
+end
+
+function PARRY.myRoot()
+    local now = os.clock()
+    if PARRY.rootCache and now - PARRY.rootAt < 0.25 and PARRY.rootCache.Parent then
+        return PARRY.rootCache
+    end
+    PARRY.rootAt = now
+    PARRY.rootCache = nil
+    local ch = PARRY.myChar()
+    if ch then
+        local ok, root = pcall(function() return ch:FindFirstChild("HumanoidRootPart") end)
+        if ok then PARRY.rootCache = root end
+    end
+    return PARRY.rootCache
+end
+
+function PARRY.distance(a, b)
+    if not a or not b then return nil end
+    local d = nil
+    pcall(function() d = (a.Position - b.Position).Magnitude end)
+    return d
+end
+
+function PARRY.ping()
+    if type(GetPingValue) == "function" then
+        local ok, v = pcall(GetPingValue)
+        if ok and type(v) == "number" then return v end
+    end
+    return 0
+end
+
+function PARRY.range()
+    local r = CFG.ppRange or 14
+    if CFG.ppPing then r = r + PARRY.ping() * 0.015 end
+    return math.max(r, CFG.ppMinRange or 13)
+end
+
+function PARRY.dagger()
+    local ch = PARRY.myChar()
+    local pack = nil
+    if lp then pcall(function() pack = lp:FindFirstChildOfClass("Backpack") end) end
+    for _, holder in ipairs({ ch, pack }) do
+        if holder then
+            for _, name in ipairs({ "Parrying Dagger", "Parry Dagger" }) do
+                local t = nil
+                pcall(function() t = holder:FindFirstChild(name) end)
+                if t then return t end
+            end
+            local ok, kids = pcall(function() return holder:GetChildren() end)
+            if ok and kids then
+                for i = 1, #kids do
+                    local n = string.lower(tostring(kids[i].Name))
+                    if n:find("dagger", 1, true) or n:find("parry", 1, true) then
+                        return kids[i]
+                    end
+                end
+            end
+        end
+    end
+end
+
+function PARRY.equip()
+    local ch = PARRY.myChar()
+    local tool = PARRY.dagger()
+    if not ch or not tool or PARRY.same(tool.Parent, ch) then return end
+    local hum = nil
+    pcall(function() hum = ch:FindFirstChildOfClass("Humanoid") end)
+    pcall(function()
+        tool.Parent = ch
+        if hum then task.spawn(function() hum:EquipTool(tool) end) end
+    end)
+end
+
+function PARRY.facing(kRoot, myRoot)
+    local delta = PARRY.distance(kRoot, myRoot)
+    if not delta or delta < 0.05 then return true end
+    local dir = nil
+    pcall(function() dir = (myRoot.Position - kRoot.Position).Unit end)
+    if not dir then return true end
+    local look = nil
+    pcall(function() look = kRoot.CFrame.LookVector end)
+    if look and look:Dot(dir) > -0.1 then return true end
+    return false
+end
+
+-- Gates cached at 5 Hz. Each GetAttribute measured ~606us here.
+function PARRY.refreshGates()
+    local now = os.clock()
+    if now - PARRY.gate.at < 0.2 then return end
+    PARRY.gate.at = now
+    local ch = PARRY.myChar()
+    if not ch then PARRY.gate.ok = false PARRY.gate.reason = "no character" return end
+
+    local hum = nil
+    pcall(function() hum = ch:FindFirstChildOfClass("Humanoid") end)
+    local hmax, hp = nil, nil
+    pcall(function() hmax = hum and hum.MaxHealth end)
+    pcall(function() hp = hum and hum.Health end)
+    if type(hmax) == "number" and hmax > 0 and type(hp) == "number"
+        and hp < hmax * ((CFG.ppHealth or 50) / 100) then
+        PARRY.gate.ok = false PARRY.gate.reason = "health too low" return
+    end
+
+    for i = 1, #PARRY.blocked do
+        local v = nil
+        pcall(function() v = ch:GetAttribute(PARRY.blocked[i]) end)
+        if v == true then
+            PARRY.gate.ok = false
+            PARRY.gate.reason = "unavailable (" .. PARRY.blocked[i] .. ")"
+            return
+        end
+    end
+
+    local interact = nil
+    pcall(function() interact = ch:FindFirstChild("CheckInterractable") end)
+    if interact then
+        for i = 1, #PARRY.actions do
+            local v = nil
+            pcall(function() v = interact:GetAttribute(PARRY.actions[i]) end)
+            if v == true then PARRY.gate.ok = false PARRY.gate.reason = "waiting for action" return end
+        end
+    end
+
+    if not PARRY.dagger() then PARRY.gate.ok = false PARRY.gate.reason = "no dagger" return end
+
+    PARRY.gate.ok = true
+    PARRY.gate.reason = "ready"
+end
+
+function PARRY.press(reason, distance)
+    if not running or not CFG.pp then return false end
+    PARRY.refreshGates()
+    if not PARRY.gate.ok then
+        PARRY.state = PARRY.gate.reason
+        PARRY.denied = PARRY.gate.reason
+        return false
+    end
+
+    local now = os.clock()
+    if now - PARRY.lastPress < (CFG.ppInterval or 0.45) then
+        PARRY.denied = "press interval"
+        return false
+    end
+
+    PARRY.lastPress = now
+    PARRY.denied = nil
+    PARRY.presses = PARRY.presses + 1
+    PARRY.reason = reason
+    PARRY.state = "pressed: " .. tostring(reason)
+
+    -- Click first: the swing's lead is the budget, not a dagger re-equip.
+    pcall(function() setrobloxinput(true) end)
+    if type(mouse2click) == "function" then pcall(mouse2click) end
+
+    if CFG.ppEquip then task.spawn(PARRY.equip) end
+
+    -- The game's own "the parry connected" flag, 350 ms later.
+    task.spawn(function()
+        task.wait(0.35)
+        local ch = PARRY.myChar()
+        if not ch then return end
+        local lands = nil
+        pcall(function() lands = ch:GetAttribute("ParryLands") end)
+        if lands == 1 or lands == true then
+            PARRY.lands = PARRY.lands + 1
+            PARRY.state = "parried"
+        end
+    end)
+    return true
+end
+
+function PARRY.collect(now)
+    local fresh = {}
+    local mine = PARRY.myChar()
+    local ok, kids = pcall(function() return Workspace:GetChildren() end)
+    if ok and type(kids) == "table" then
+        for i = 1, #kids do
+            local model = kids[i]
+            if model.ClassName == "Model" and not PARRY.same(model, mine) then
+                local root = nil
+                pcall(function() root = model:FindFirstChild("HumanoidRootPart") end)
+                local hum = nil
+                pcall(function() hum = model:FindFirstChildOfClass("Humanoid") end)
+                if root and hum then
+                    local killer = false
+                    for j = 1, #PP_KILLER_ATTRS do
+                        local v = nil
+                        pcall(function() v = model:GetAttribute(PP_KILLER_ATTRS[j]) end)
+                        if v ~= nil then killer = true break end
+                    end
+                    if killer then
+                        local key = PARRY.addr(model)
+                        local t = PARRY.targets[key]
+                        if not t then
+                            t = { char = model }
+                            PARRY.targets[key] = t
+                        end
+                        t.char = model
+                        t.root = root
+                        t.interact = model:FindFirstChild("CheckInterractable")
+                        fresh[key] = true
+                    end
+                end
+            end
+        end
+    end
+    for key, t in pairs(PARRY.targets) do
+        local alive = false
+        pcall(function() alive = t.char ~= nil and t.char.Parent ~= nil end)
+        if not fresh[key] or not alive then PARRY.targets[key] = nil end
+    end
+end
+
+-- The trigger. AC_AllowedSpeed in 20..40 is the swing; the stab flag follows
+-- it by a poll and waiting for it only burns lead.
+function PARRY.windup(t, distance, myRoot)
+    local stab, allowed = nil, nil
+    pcall(function() stab = t.char:GetAttribute("LowerBodyStabilize") end)
+    pcall(function() allowed = t.char:GetAttribute("AC_AllowedSpeed") end)
+
+    local active = type(allowed) == "number" and allowed >= 20 and allowed <= 40
+    if not active then
+        t.windupFired = false
+        return
+    end
+    if t.windupFired then return end
+    if distance > PARRY.range() then return end
+    if CFG.ppFacing and t.root and myRoot and not PARRY.facing(t.root, myRoot) then return end
+
+    t.windupFired = true
+    if CFG.ppAim and t.root then
+        task.spawn(function()
+            local cam = nil
+            pcall(function() cam = Workspace.CurrentCamera end)
+            if not cam then return end
+            local pos, target = nil, nil
+            pcall(function() pos = cam.CFrame.Position end)
+            pcall(function() target = t.root.Position end)
+            if pos and target then pcall(function() cam.CFrame = CFrame.new(pos, target) end) end
+        end)
+    end
+    PARRY.press("windup", distance)
+end
+
+function PARRY.step()
+    if not CFG.pp then PARRY.state = "Disabled" return end
+    local now = os.clock()
+    if now >= PARRY.lastCollect + 1 then
+        PARRY.lastCollect = now
+        PARRY.collect(now)
+    end
+
+    -- keep the status honest even when no swing is happening
+    pcall(PARRY.refreshGates)
+
+    local windupDue = CFG.ppWindup and now >= PARRY.lastWindup + 1 / (CFG.ppWindupHz or 120)
+    if windupDue then PARRY.lastWindup = now end
+
+    local myRoot = PARRY.myRoot()
+    local hadPress = PARRY.presses
+    for _, t in pairs(PARRY.targets) do
+        local live = false
+        pcall(function() live = t.root ~= nil and t.root.Parent ~= nil end)
+        if live and myRoot then
+            local distance = PARRY.distance(t.root, myRoot)
+            if distance and distance <= (CFG.ppScanRange or 70) then
+                PARRY.scans = PARRY.scans + 1
+                if windupDue then
+                    local ok, err = pcall(PARRY.windup, t, distance, myRoot)
+                    if not ok then PARRY.error = tostring(err) end
+                end
+            end
+        end
+    end
+
+    if PARRY.presses == hadPress and PARRY.state ~= "parried" then
+        if not myRoot then
+            PARRY.state = "waiting for character"
+        elseif PARRY.gate.ok or PARRY.denied == nil then
+            PARRY.state = "watching"
+        else
+            PARRY.state = PARRY.denied or "watching"
+        end
+    end
+end
+
+task.spawn(function()
+    while running do
+        if CFG.pp then
+            local ok, err = pcall(PARRY.step)
+            if not ok then
+                PARRY.state = "read error"
+                PARRY.error = tostring(err)
+            end
+        end
+        task.wait(1 / (CFG.ppHz or 120))
+    end
+end)
+
+task.spawn(function()
+    while running do
+        if CFG.pp and CFG.ppEquip then
+            local myRoot = PARRY.myRoot()
+            if myRoot then
+                for _, t in pairs(PARRY.targets) do
+                    local d = PARRY.distance(t.root, myRoot)
+                    if d and d <= (CFG.ppEquipRange or 45) then
+                        PARRY.equip()
+                        break
+                    end
+                end
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+function API.ParryStatus()
+    local n = 0
+    for _ in pairs(PARRY.targets) do n = n + 1 end
+    return {
+        enabled = CFG.pp, state = PARRY.state, presses = PARRY.presses,
+        lands = PARRY.lands, scans = PARRY.scans, targets = n,
+        denied = PARRY.denied, reason = PARRY.reason, error = PARRY.error,
+        gate = PARRY.gate.reason,
+    }
+end
+function API.SetParry(on)
+    CFG.pp = on and true or false
+    if not CFG.pp then PARRY.state = "Disabled" end
+    return CFG.pp
+end
+
+-- measured content height per tab, plus the window height and how much of
+-- the active tab is scrolled away. Used to check the layout fits.
+function API.Layout()
+    if not uiWindow then return {} end
+    local w = uiWindow.w - uiWindow.sideW - 16
+    local out = {}
+    for _, tb in ipairs(uiWindow.tabs) do
+        out[#out + 1] = { name = tb.name, h = tb:Measure(w) }
+    end
+    return out, uiWindow.h, uiWindow.scrollMax
+end
 -- hud: killer timers, generators, survivors
 HUD.lines, HUD.rows, HUD.count = {}, {}, 0
 HUD.k = { attrs = {} }
@@ -2644,7 +3653,9 @@ HUD.findKiller = function(now)
     if now - HUD.lastFind < 2 then return nil end
     HUD.lastFind = now
     K.player, K.char, K.type = nil, nil, nil
-    for _, plr in ipairs(Players:GetPlayers()) do
+    local okP, players = pcall(function() return Players:GetPlayers() end)
+    if not okP or type(players) ~= "table" then players = {} end
+    for _, plr in ipairs(players) do
         local ok, team = pcall(function() return plr.Team and plr.Team.Name end)
         if ok and team == "Killer" then
             K.player = plr
@@ -2823,7 +3834,9 @@ end
 
 HUD.rescanSurvivors = function()
     HUD.surv = {}
-    for _, plr in ipairs(Players:GetPlayers()) do
+    local okP, players = pcall(function() return Players:GetPlayers() end)
+    if not okP or type(players) ~= "table" then players = {} end
+    for _, plr in ipairs(players) do
         local ok, team = pcall(function() return plr.Team and plr.Team.Name end)
         if ok and team == "Survivors" then
             local e = HUD.scanSurvivor(plr)
@@ -2970,6 +3983,28 @@ HUD.renderSurvivors = function(put)
     end
 end
 
+-- `...Until` attributes are absolute deadlines, but the game does not put them
+-- all on one clock: Veil writes epoch seconds (os.time) while AC_* writes
+-- os.clock seconds. Take whichever clock puts the deadline inside a believable
+-- window, and fall back to the raw number when neither does (a counter, a flag
+-- or a clock this build has not met yet).
+HUD.untilLeft = function(name, value, now)
+    if type(name) ~= "string" or name:sub(-5) ~= "Until" then return nil end
+    if type(value) ~= "number" or value ~= value or value == math.huge then return nil end
+    if value <= 0 then return 0 end
+    local epoch = os.time()
+    -- epoch seconds (and milliseconds) are unmistakable, so a long cooldown still
+    -- reads out; everything else must land near a clock we can actually read, so
+    -- a plain counter is never mistaken for a deadline
+    if value > 1e12 then return value / 1000 - epoch end
+    if value > 1e9 then return value - epoch end
+    local left = value - now
+    if left >= -3600 and left <= 3600 then return left end
+    left = value / 1000 - now
+    if left >= -3600 and left <= 3600 then return left end
+    return nil
+end
+
 HUD.build = function(now)
     local L = HUD.lines
     local n = 0
@@ -3068,12 +4103,23 @@ HUD.build = function(now)
                     if rec.spec and rec.spec.readyFlag and rec.value == false then
                         label, colour = shown .. "   on cooldown", HUD.cCool
                     elseif type(rec.value) == "number" then
-                        local suffix = ""
-                        if rec.peak and rec.peak ~= rec.value then
-                            suffix = "/" .. tostring(rec.peak)
+                        local left = HUD.untilLeft(name, rec.value, now)
+                        if left then
+                            if left <= 0 then
+                                label, colour = shown .. "   ready", HUD.cReady
+                            elseif left >= 10 then
+                                label, colour = string.format("%s   %.0fs", shown, left), HUD.cCool
+                            else
+                                label, colour = string.format("%s   %.1fs", shown, left), HUD.cCool
+                            end
+                        else
+                            local suffix = ""
+                            if rec.peak and rec.peak ~= rec.value then
+                                suffix = "/" .. tostring(rec.peak)
+                            end
+                            label = shown .. "   " .. tostring(rec.value) .. suffix
+                            colour = HUD.cReady
                         end
-                        label = shown .. "   " .. tostring(rec.value) .. suffix
-                        colour = HUD.cReady
                     else
                         label, colour = shown .. "   ready", HUD.cReady
                     end
@@ -3110,6 +4156,20 @@ HUD.build = function(now)
 
     for i = n + 1, #L do L[i] = nil end
     HUD.lineCount = n
+    -- keep every line inside the panel and the rows tall enough for the font
+    local _, glyphH = HUD.measure("Ag")
+    if glyphH > 0 then
+        local pitch = math.max(16, math.ceil(glyphH) + 3)
+        if pitch > 24 then pitch = 24 end
+        if HUD.lineH ~= pitch then HUD.lineH = pitch end
+    end
+    local maxw = HUD.w - 20
+    for i = 1, n do
+        local e = L[i]
+        if #e.t > 0 and HUD.measure(e.t) > maxw then
+            e.t = HUD.fit(e.t, maxw)
+        end
+    end
 end
 
 HUD.obj = function(kind, z)
@@ -3117,6 +4177,36 @@ HUD.obj = function(kind, z)
     if not ok or not d then return nil end
     pcall(function() d.Visible = false; d.ZIndex = z end)
     return d
+end
+
+-- measure HUD text with its real font so lines are clipped to the panel and
+-- the row pitch matches the glyph height (16 px pitch on a 17 px glyph made
+-- every line sit on top of the one below it)
+HUD.measure = function(s)
+    local m = HUD.meas
+    if not m then
+        m = HUD.obj("Text", 0)
+        if not m then return 0, 0 end
+        m.Size = 13
+        pcall(function() m.Font = FONT end)
+        HUD.meas = m
+    end
+    m.Text = tostring(s)
+    local b = m.TextBounds
+    return (b and b.X) or (#tostring(s) * 8), (b and b.Y) or 16
+end
+
+HUD.fit = function(s, maxw)
+    s = tostring(s)
+    if maxw <= 8 then return "" end
+    local w = HUD.measure(s)
+    if w <= maxw then return s end
+    while #s > 1 do
+        s = s:sub(1, #s - 1)
+        local cand = s .. ".."
+        if HUD.measure(cand) <= maxw then return cand end
+    end
+    return ""
 end
 
 HUD.hide = function()
@@ -3137,6 +4227,7 @@ HUD.destroy = function()
     if HUD.title then pcall(function() HUD.title:Remove() end) end
     if HUD.close then pcall(function() HUD.close:Remove() end) end
     for _, r in ipairs(HUD.rows) do pcall(function() r.t:Remove() end) end
+    if HUD.meas then pcall(function() HUD.meas:Remove() end) HUD.meas = nil end
     HUD.bg, HUD.border, HUD.accent, HUD.title, HUD.close = nil, nil, nil, nil, nil
     HUD.rows, HUD.shown, HUD.count = {}, false, 0
     HUD.gx, HUD.gy, HUD.gw, HUD.gh = nil, nil, nil, nil
@@ -3213,7 +4304,8 @@ HUD.render = function(now, moveOnly)
     if n == 0 then if HUD.shown then HUD.hide() end return end
 
     local w = HUD.w
-    local h = 26 + n * 16 + 6
+    local pitch = HUD.lineH or 16
+    local h = 26 + n * pitch + 6
     local cam = Workspace.CurrentCamera
     local vp = cam and cam.ViewportSize
     local vw, vh = (vp and vp.X) or 1920, (vp and vp.Y) or 1080
@@ -3314,7 +4406,7 @@ HUD.render = function(now, moveOnly)
                 r.t.Color = d.c
                 r.colour = d.c
             end
-            local rx, ry = x + 10, y + 28 + (i - 1) * 16
+            local rx, ry = x + 10, y + 28 + (i - 1) * pitch
             if r.rx ~= rx or r.ry ~= ry then
                 r.t.Position = Vector2.new(rx, ry)
                 r.rx, r.ry = rx, ry
@@ -3366,10 +4458,12 @@ HUD.tick = function()
 end
 
 task.spawn(function()
-    while running do
+    -- a reload replaces __SWANGY_LOAD: a stale instance must stop drawing so
+    -- two panels can never stack their text on top of each other
+    while running and _G.__SWANGY_LOAD == loadToken do
         local ok, err = pcall(HUD.tick)
         if not ok then HUD.lastError = tostring(err) end
-        task.wait(ok and (HUD.drag and 1 / 60 or (CFG.hud and 0.05 or 0.25)) or 0.5)
+        task.wait(ok and (HUD.drag and 1 / 60 or (CFG.hud and 0.08 or 0.25)) or 0.5)
     end
     pcall(HUD.destroy)
 end)
@@ -3387,6 +4481,22 @@ function API.hud.Lines()
     local out = {}
     for i = 1, #HUD.lines do out[i] = HUD.lines[i].t end
     return out
+end
+function API.hud.Rows()
+    local out = {}
+    for i = 1, #HUD.rows do
+        local r = HUD.rows[i]
+        local t = r and r.t
+        local p = t and t.Position
+        out[i] = {
+            text = t and t.Text or nil,
+            x = p and math.floor(p.X + 0.5) or nil,
+            y = p and math.floor(p.Y + 0.5) or nil,
+            visible = t and t.Visible or false,
+            size = t and t.Size or nil,
+        }
+    end
+    return out, HUD.x, HUD.y, HUD.w
 end
 function API.hud.Panel()
     return {
@@ -3624,7 +4734,7 @@ end
 task.spawn(function()
     while running do
         local ok = pcall(kbwRender)
-        task.wait(ok and 1 / 30 or 0.5)
+        task.wait(ok and (kbw.drag and 1 / 60 or 1 / 20) or 0.5)
     end
     pcall(kbwDestroy)
 end)
@@ -3719,6 +4829,20 @@ end
 
 local D = hostGet("Drawing") or Drawing
 local RS = hostGet("RunService") or RunService
+
+-- this VM drops the `workspace` global and `Workspace.CurrentCamera`
+-- intermittently; one nil camera used to kill the whole window frame
+-- (Matcha:2091). Resolve it defensively and never index a nil workspace.
+local function uiCamera()
+    local c
+    pcall(function() c = workspace.CurrentCamera end)
+    if c then return c end
+    local ok, ws = pcall(function() return game:GetService("Workspace") end)
+    if ok and ws then pcall(function() c = ws.CurrentCamera end) end
+    if c then return c end
+    pcall(function() c = game.Workspace.CurrentCamera end)
+    return c
+end
 local UIS = hostGet("UserInputService") or UserInputService
 local floor, abs, min, max, clamp = math.floor, math.abs, math.min, math.max, math.clamp
 local clock, fmt = os.clock, string.format
@@ -4320,7 +5444,7 @@ end
 local function renderNotifs()
     local opts = Library.NotificationOptions
     local right = Library.NotifySide ~= "Left"
-    local cam = workspace.CurrentCamera
+    local cam = uiCamera()
     local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
     local w = opts.Width or 260
     local x = right and (vp.X - w - 16) or 16
@@ -4490,7 +5614,7 @@ function KeyPicker:RenderPopup()
     local modes = { "Hold", "Toggle", "Always" }
     local rowH = 20
     local pw, ph = 88, rowH * #modes + 6
-    local cam = workspace.CurrentCamera
+    local cam = uiCamera()
     local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
     local px, py = self.boxX or 0, (self.boxY or 0) + (self.boxH or 18) + 2
     if px + pw > vp.X - 8 then px = vp.X - pw - 8 end
@@ -4650,7 +5774,7 @@ end
 function ColorPicker:RenderPopup()
     if not self.popupOpen then return end
     local pw, ph = 204, 168
-    local cam = workspace.CurrentCamera
+    local cam = uiCamera()
     local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
     local px, py = self.hx - pw + 20, self.hy + 24
     if px < 8 then px = 8 end
@@ -5006,7 +6130,9 @@ function Label:Render(x, y, w)
     for i, ln in ipairs(lines) do
         local o = self.lines[i]
         if not o then o = mkText(self, size) self.lines[i] = o end
-        text(o, x, y + (i - 1) * 18, ln, size, self.color or Theme.text, 0.85, false, false)
+        -- a single word wider than the box cannot be wrapped, so clip the
+        -- wrapped line too: labels must never draw past their section box
+        text(o, x, y + (i - 1) * 18, clipText(ln, size, endX), size, self.color or Theme.text, 0.85, false, false)
     end
     for i = #lines + 1, #self.lines do put(self.lines[i], "Visible", false) end
 end
@@ -5132,7 +6258,7 @@ function Dropdown:RenderPopup()
     local scrollMax = max(0, total - vis)
     self.scroll = clamp(self.scroll or 0, 0, scrollMax)
     local pw, ph = self.hw, rowH * vis + 8
-    local cam = workspace.CurrentCamera
+    local cam = uiCamera()
     local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
     local px, py = self.hx, self.hy + 21 + 3
     if py + ph > vp.Y - 8 then py = self.hy - ph - 3 end
@@ -5347,6 +6473,30 @@ function Groupbox:AddColorPicker(id, cfg)
     register(id, el, Library.ColorPickers)
     return el
 end
+-- scroll culling helpers: an element that is outside the visible content
+-- rect is hidden rather than drawn above or below the window
+local function hideItem(o)
+    if not o then return end
+    if o.sc then o.sc.Visible = false end
+    if o.d then o.d.Visible = false end
+end
+
+local function hideElement(el)
+    if not el then return end
+    for _, o in ipairs(el.objects or {}) do hideItem(o) end
+    for _, a in ipairs(el.addons or {}) do
+        for _, o in ipairs(a.objects or {}) do hideItem(o) end
+    end
+end
+
+local function hideGroup(g)
+    hideItem(g.bg)
+    hideItem(g.border)
+    hideItem(g.title)
+    hideItem(g.descText)
+    for _, el in ipairs(g.elements) do hideElement(el) end
+end
+
 function Groupbox:GetHeight(w)
     local h = 6 + 15 + (self.desc and self.desc ~= "" and 16 or 0) + 6
     local lw = w - 12
@@ -5355,13 +6505,34 @@ function Groupbox:GetHeight(w)
     end
     return h
 end
-function Groupbox:Render(x, y, w)
+function Groupbox:Render(x, y, w, clip)
     local h = self:GetHeight(w)
-    fill(self.bg, x, y, w, h, Theme.bg, 1, Library.CornerRadius)
-    stroke(self.border, x, y, w, h, Theme.outline, 1, Library.CornerRadius, 1)
-    text(self.title, x + 10, y + 6, clipText(self.name, 15, w - 20), 15, Theme.text, 1, false, false)
+    -- strict clip: a box or row that is not fully inside the window content
+    -- rect must not draw at all. The old check only hid things once they were
+    -- completely out, so partial rows and box edges hung past the border.
+    local vTop, vBottom = y, y + h
+    if clip then
+        vTop = max(y, clip.top)
+        vBottom = min(y + h, clip.bottom)
+        if vBottom - vTop < 0.5 then
+            hideGroup(self)
+            return h
+        end
+    end
+    local cut = clip and (vTop > y or vBottom < y + h)
+    fill(self.bg, x, vTop, w, vBottom - vTop, Theme.bg, 1, cut and 0 or Library.CornerRadius)
+    stroke(self.border, x, vTop, w, vBottom - vTop, Theme.outline, 1, cut and 0 or Library.CornerRadius, 1)
+    if clip and (y < clip.top or y + 21 > clip.bottom) then
+        put(self.title, "Visible", false)
+    else
+        text(self.title, x + 10, y + 6, clipText(self.name, 15, w - 20), 15, Theme.text, 1, false, false)
+    end
     if self.desc and self.desc ~= "" then
-        text(self.descText, x + 10, y + 22, clipText(self.desc, 14, w - 20), 14, Theme.subtext, 1, false, false)
+        if clip and (y + 22 < clip.top or y + 38 > clip.bottom) then
+            put(self.descText, "Visible", false)
+        else
+            text(self.descText, x + 10, y + 22, clipText(self.desc, 14, w - 20), 14, Theme.subtext, 1, false, false)
+        end
     else
         put(self.descText, "Visible", false)
     end
@@ -5369,7 +6540,9 @@ function Groupbox:Render(x, y, w)
     for _, el in ipairs(self.elements) do
         if el.visible and not el.destroyed then
             local eh = el:GetHeight(w - 12)
-            if el.row and el.RenderRow then
+            if clip and (ey < clip.top - 0.01 or ey + eh > clip.bottom + 0.01) then
+                hideElement(el)
+            elseif el.row and el.RenderRow then
                 el:RenderRow(x + 6, ey, w - 12, eh)
             else
                 el:Render(x + 6, ey, w - 12)
@@ -5459,13 +6632,26 @@ function Tab:AddRightGroupbox(name, cfg)
     cfg = cfg or {} cfg.Name = name cfg.Side = "Right"
     return self:AddGroupbox(cfg)
 end
-function Tab:Render(x, y, w)
+function Tab:Measure(w)
     local colW = w / 2 - 3
-    local ly, ry = y, y
+    local lh, rh = 0, 0
     for _, g in ipairs(self.groups) do
         if g.visible then
-            if g.side == "Left" then ly = ly + g:Render(x, ly, colW) + 6
-            else ry = ry + g:Render(x + colW + 6, ry, colW) + 6 end
+            local gh = g:GetHeight(colW) + 6
+            if g.side == "Left" then lh = lh + gh else rh = rh + gh end
+        end
+    end
+    return math.max(lh, rh)
+end
+
+function Tab:Render(x, y, w, clip, scroll)
+    local colW = w / 2 - 3
+    local top = y - (scroll or 0)
+    local ly, ry = top, top
+    for _, g in ipairs(self.groups) do
+        if g.visible then
+            if g.side == "Left" then ly = ly + g:Render(x, ly, colW, clip) + 6
+            else ry = ry + g:Render(x + colW + 6, ry, colW, clip) + 6 end
         end
     end
 end
@@ -5545,6 +6731,7 @@ function Window:SelectTab(tab)
         focusedInput = nil
         capturing = nil
         self.tabFade = 0
+        self.scroll = 0
     end
     return self
 end
@@ -5569,7 +6756,7 @@ end
 function Window:Open() return self:Toggle(true) end
 function Window:Close() return self:Toggle(false) end
 function Window:SetPos(px, py)
-    local cam = workspace.CurrentCamera
+    local cam = uiCamera()
     local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
     self.x = clamp(px, -self.w + 80, vp.X - 80)
     self.y = clamp(py, 0, vp.Y - 40)
@@ -5582,13 +6769,40 @@ function Window:SetSize(w, h)
     self.tabSelY, self.tabSelH = nil, nil
     return self
 end
+
+function Window:ScrollToY(py, barY, barH, thumbH)
+    local span = math.max(1, barH - thumbH)
+    local f = clamp((py - barY - thumbH * 0.5) / span, 0, 1)
+    self.scroll = f * (self.scrollMax or 0)
+    return self
+end
 function Window:Center()
-    local cam = workspace.CurrentCamera
+    local cam = uiCamera()
     local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
     self:SetPos((vp.X - self.w) / 2, (vp.Y - self.h) / 2)
     return self
 end
 function Window:Render()
+    -- fit before drawing: sizing mid-frame leaves the chrome at the old rect.
+    -- Grow once to the tallest tab, bounded by the viewport; a manual resize
+    -- below the content hands over to the scrollbar.
+    if self.activeTab and not self.autoSized and not self.userSized then
+        local cw = self.w - self.sideW - 16
+        local tallest = self.activeTab:Measure(cw)
+        for _, tb in ipairs(self.tabs) do
+            local m = tb:Measure(cw)
+            if m > tallest then tallest = m end
+        end
+        local cam = uiCamera()
+        local vpY = (cam and cam.ViewportSize and cam.ViewportSize.Y) or 1080
+        local want = math.min(tallest + self.titleH + 30, vpY - 40)
+        if want > self.h then
+            self:SetSize(self.w, want)
+            self:Center()
+        end
+        self.autoSized = true
+    end
+
     local x, y, w, h = self.x, self.y, self.w, self.h
     local titleH = self.titleH
     local sideW = self.sideW
@@ -5658,9 +6872,35 @@ function Window:Render()
     end
 
     local cx, cy = x + sideW + 4, y + titleH + 4
-    local cw, ch = w - sideW - 8, h - titleH - 8
+    local cw, ch = w - sideW - 16, h - titleH - 8
     if self.activeTab then
-        self.activeTab:Render(cx, cy, cw)
+        local contentH = self.activeTab:Measure(cw)
+
+        local scrollMax = contentH - ch
+        if scrollMax < 0 then scrollMax = 0 end
+        self.scrollMax = scrollMax
+        self.scroll = clamp(self.scroll or 0, 0, scrollMax)
+        self.activeTab:Render(cx, cy, cw, { top = cy, bottom = cy + ch }, self.scroll)
+
+        -- scrollbar: the moment anything is clipped, even by a pixel
+        if scrollMax > 0.01 then
+            local barX, barY, barW, barH = x + w - 12, cy, 5, ch
+            fill(self.scrollTrack, barX, barY, barW, barH, Theme.main, 0.55, 3)
+            put(self.scrollTrack, "Visible", true)
+            local thumbH = math.max(28, barH * (ch / contentH))
+            local span = barH - thumbH
+            local frac = scrollMax > 0 and (self.scroll / scrollMax) or 0
+            local thumbY = barY + span * frac
+            fill(self.scrollThumb, barX, thumbY, barW, thumbH, Theme.accent, 1, 3)
+            put(self.scrollThumb, "Visible", true)
+            newHit(barX - 4, barY, barW + 8, barH, {
+                press = function(_, py) self:ScrollToY(py, barY, barH, thumbH) end,
+                drag = function(_, py) self:ScrollToY(py, barY, barH, thumbH) end,
+            })
+        else
+            put(self.scrollTrack, "Visible", false)
+            put(self.scrollThumb, "Visible", false)
+        end
     end
 
     newHit(x, y, w - 28, titleH, {
@@ -5674,6 +6914,7 @@ function Window:Render()
         press = function(px, py) self.sizeOff = { w - (px - x), h - (py - y) } end,
         drag = function(px, py)
             if self.sizeOff then
+                self.userSized = true
                 self:SetSize(max(480, px - x + self.sizeOff[1]), max(360, py - y + self.sizeOff[2]))
             end
         end,
@@ -5788,6 +7029,9 @@ function Library:CreateWindow(cfg)
     win.x, win.y = 100, 100
     win.tabs, win.activeTab = {}, nil
     win.tabFade = 0
+    win.scroll, win.scrollMax = 0, 0
+    win.scrollTrack = newObj("Square", 9)
+    win.scrollThumb = newObj("Square", 10)
     win.visible = cfg.AutoShow ~= false
     win.bg = newObj("Square", 2)
     win.border = newObj("Square", 3)
@@ -5895,7 +7139,7 @@ local function tickLoop(dt)
                 local reg = _G.__swangy_wms
                 reg[#reg + 1] = wm
             end
-            local cam = workspace.CurrentCamera
+            local cam = uiCamera()
             local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
             local pos = Library.__wmPos or { x = 10, y = 10 }
             local s = win0Text()
@@ -6889,6 +8133,9 @@ local function buildUI()
     local statusGroup = mainTab:AddGroupbox({ Side = "Right", Name = "Status" })
     local statusLabel = statusGroup:AddLabel({ Text = "starting...", DoesWrap = true })
     local statsLabel = statusGroup:AddLabel({ Text = "checks 0  hits 0  misses 0", DoesWrap = true })
+    statusGroup:AddDivider("Parry")
+    local ppStateLabel = statusGroup:AddLabel({ Text = "parry: --", DoesWrap = true })
+    local ppStatsLabel = statusGroup:AddLabel({ Text = "presses 0", DoesWrap = true })
     statusGroup:AddDivider("Session")
     statusGroup:AddLabel({ Text = "Credit: UI is Swangy by aphalia (github.com/YoungSlaves/matchaUI).", DoesWrap = true })
     statusGroup:AddDivider("Keys")
@@ -6904,6 +8151,13 @@ local function buildUI()
             if statsLabel then
                 statsLabel:SetText(string.format("checks %d  hits %d  misses %d  errors %d",
                     scStats.checks, scStats.hits, scStats.misses, scStats.errors))
+            end
+            if ppStateLabel then
+                ppStateLabel:SetText("parry: " .. tostring(PARRY.state or "--"))
+            end
+            if ppStatsLabel then
+                ppStatsLabel:SetText(string.format("presses %d  parried %d  %s",
+                    PARRY.presses, PARRY.lands, tostring(PARRY.denied or PARRY.gate.reason or "--")))
             end
             task.wait(0.25)
         end
@@ -6962,6 +8216,40 @@ local function buildUI()
     })
     aimGroup:AddLabel({
         Text = "Click the key box to bind. Right-click it for Hold / Toggle / Always. Escape clears it.",
+        DoesWrap = true,
+    })
+
+    local ppGroup = mainTab:AddGroupbox({ Side = "Left", Name = "Auto Parry", Description = "windup-attribute parry, mouse2click" })
+    local ppToggle = ppGroup:AddToggle("pp_enabled", {
+        Text = "Auto parry",
+        Default = CFG.pp,
+        Callback = function(on)
+            CFG.pp = on and true or false
+            if not CFG.pp then PARRY.state = "Disabled" end
+            if UI then UI:Notify("Auto parry  [ " .. (CFG.pp and "ON" or "OFF") .. " ]", 2, "Swangy") end
+        end,
+    })
+    ppToggle:AddKeyPicker("pp_key", { Text = "Parry key", Mode = "Always" })
+    ppGroup:AddSlider("pp_range", {
+        Text = "Range", Default = CFG.ppRange,
+        Min = 4, Max = 25, Rounding = 1, Suffix = " studs",
+        Callback = function(v) CFG.ppRange = v end,
+    })
+    ppGroup:AddSlider("pp_health", {
+        Text = "Minimum health", Default = CFG.ppHealth,
+        Min = 10, Max = 100, Rounding = 5, Suffix = "%",
+        Callback = function(v) CFG.ppHealth = v end,
+    })
+    ppGroup:AddToggle("pp_windup", {
+        Text = "Windup fallback", Default = CFG.ppWindup,
+        Callback = function(on) CFG.ppWindup = on and true or false end,
+    })
+    ppGroup:AddToggle("pp_equip", {
+        Text = "Auto equip dagger", Default = CFG.ppEquip,
+        Callback = function(on) CFG.ppEquip = on and true or false end,
+    })
+    ppGroup:AddLabel({
+        Text = "Key box: click to bind, right-click for Hold / Toggle / Always, Escape clears.",
         DoesWrap = true,
     })
 
@@ -7044,13 +8332,31 @@ local function buildUI()
         Callback = function(c) CFG.trapSprungColour = c end,
     })
 
+    local pumpToggle = espGroup:AddToggle("esp_pumpkin", {
+        Text = "Pumpkin ESP",
+        Default = CFG.pump,
+        Callback = function(on) API.pumpkin.SetEnabled(on) end,
+    })
+    pumpToggle:AddColorPicker("esp_pumpkin_col", {
+        Title = "Pumpkin colour", Default = CFG.pumpColour,
+        Callback = function(c) CFG.pumpColour = c end,
+    })
+
     espGroup:AddToggle("esp_names", {
         Text = "Nametags",
         Default = CFG.names,
         Callback = function(on) CFG.names = on and true or false end,
     })
+    espGroup:AddToggle("esp_names_only", {
+        Text = "Nametags only (no boxes)",
+        Default = CFG.namesOnly,
+        Callback = function(on)
+            CFG.namesOnly = on and true or false
+            if CFG.namesOnly then CFG.names = true end
+        end,
+    })
     espGroup:AddLabel({
-        Text = "Nametags off keeps the boxes. Generator progress always shows while generator ESP is on.",
+        Text = "Nametags off keeps the boxes. Nametags only drops the boxes and keeps the labels.",
         DoesWrap = true,
     })
     espGroup:AddSlider("esp_range", {
@@ -7058,7 +8364,7 @@ local function buildUI()
         Min = 0, Max = 10000, Rounding = 1, Suffix = " studs",
         Callback = function(v)
             CFG.espRange = v
-            CFG.genRange, CFG.winRange, CFG.palRange, CFG.trapRange = v, v, v, v
+            CFG.genRange, CFG.winRange, CFG.palRange, CFG.trapRange, CFG.pumpRange = v, v, v, v, v
         end,
     })
 
