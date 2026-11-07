@@ -113,13 +113,13 @@ local CFG = {
     genFill   = true,
     genFillA  = 0.25,
     genThick  = 1.6,
-    genIdleColour   = Color3.fromRGB(255, 150, 40),
+    genIdleColour   = Color3.fromRGB(26, 255, 51),
     genDoneColour   = Color3.fromRGB(51, 255, 77),
     genBrokenColour = Color3.fromRGB(255, 120, 120),
 
     win       = true,
     winRange  = 1000,
-    winPool   = 24,
+    winPool   = 32,
     winText   = 12,
     winFill   = true,
     winFillA  = 0.20,
@@ -133,7 +133,7 @@ local CFG = {
     palFill   = true,
     palFillA  = 0.20,
     palThick  = 1.6,
-    palColour     = Color3.fromRGB(139, 90, 50),
+    palColour     = Color3.fromRGB(255, 26, 26),
     palDownColour = Color3.fromRGB(255, 140, 26),
 
     trap          = true,
@@ -866,9 +866,10 @@ local function updateGenStates(list)
     end
 end
 
+-- reference boxColour: only a regressing generator breaks the ramp; a paused or
+-- idle one shows its real progress on the gen1 -> genDone ramp
 local function genColour(prog, state)
     if state == "regress" then return CFG.genBrokenColour end
-    if state == "paused" then return COL.genPause end
     return lerpColor(CFG.genIdleColour, CFG.genDoneColour, (prog or 0) / 100)
 end
 
@@ -1007,57 +1008,40 @@ RT.walk = function(root, maxDepth, maxVisit, budget, test)
 end
 
 -- windows
--- The map is walked in chunks: a time budget handed back a partial list (which
--- is why windows came and went) and one full pass blocks the frame. The stack
--- lives on RT between calls, so every scan reaches the end, no call is long,
--- and no yield happens inside the caller's pcall.
+-- Exactly the reference scan (window_esp.lua): every descendant of Map whose name
+-- mentions "window" is a container, its part descendants are the windows, and when
+-- any of those parts is literally called "Bottom" only the Bottom parts are drawn.
+-- The reference does this in one GetDescendants pass and redraws once a second.
+-- The chunked walk this replaces needed several passes and only looked again 30s
+-- later, so a window that streamed in after the first pass never appeared -- that
+-- is the win=0 bug.
 local function collectWindows()
-    local out = {}
     local map = Workspace:FindFirstChild("Map")
-    -- nil means "not finished / could not scan": the caller keeps what it has
     if not map then return nil end
-    if not RT.winStack then RT.winStack, RT.winNamed = { map }, {} end
+    local okAll, desc = pcall(RT.io.descendants, map)
+    if not okAll or type(desc) ~= "table" then return nil end
 
-    local stack, named = RT.winStack, RT.winNamed
-    local seen = 0
-    while #stack > 0 and seen < 2000 do
-        local node = table.remove(stack)
-        seen = seen + 1
-        local okKids, kids = pcall(RT.io.children, node)
-        if okKids and type(kids) == "table" then
-            for i = 1, #kids do
-                local inst = kids[i]
-                local okc, cls, nm = pcall(RT.io.clsName, inst)
-                if okc then
-                    if nm and lower(nm):find("window", 1, true) then
-                        named[#named + 1] = inst
-                    end
-                    if cls == "Model" or cls == "Folder" then
-                        stack[#stack + 1] = inst
-                    end
+    local candidates = {}
+    for i = 1, #desc do
+        local inst = desc[i]
+        local okc, nm = pcall(function() return inst.Name end)
+        if okc and nm and lower(nm):find("window", 1, true) then
+            if isPart(inst) then candidates[#candidates + 1] = inst end
+            local okKids, kids = pcall(RT.io.descendants, inst)
+            if okKids and type(kids) == "table" then
+                for j = 1, #kids do
+                    local k = kids[j]
+                    if isPart(k) then candidates[#candidates + 1] = k end
                 end
             end
         end
     end
-    if #stack > 0 then return nil end
-    RT.winStack, RT.winNamed = nil, nil
 
-    local candidates = {}
-    for _, d in ipairs(named) do
-        -- a window that is itself a part has no descendants to collect, so take
-        -- it directly instead of silently skipping it
-        if isPart(d) then candidates[#candidates + 1] = d end
-        local okKids, kids = pcall(RT.io.descendants, d)
-        if okKids and type(kids) == "table" then
-            for _, k in ipairs(kids) do
-                if isPart(k) then candidates[#candidates + 1] = k end
-            end
-        end
-    end
-
+    -- the external keys off the part literally named "Bottom"
     local anyBottom = false
-    for _, k in ipairs(candidates) do
-        if lower(k.Name) == "bottom" then anyBottom = true break end
+    for i = 1, #candidates do
+        local okn, nm = pcall(function() return candidates[i].Name end)
+        if okn and nm and lower(nm) == "bottom" then anyBottom = true break end
     end
 
     local function entryFor(part)
@@ -1083,8 +1067,11 @@ local function collectWindows()
         return e
     end
 
-    for _, k in ipairs(candidates) do
-        if (not anyBottom) or lower(k.Name) == "bottom" then
+    local out = {}
+    for i = 1, #candidates do
+        local k = candidates[i]
+        local okn, nm = pcall(function() return k.Name end)
+        if (not anyBottom) or (okn and nm and lower(nm) == "bottom") then
             local e = entryFor(k)
             -- same sanity limits as the reference: a zero-sized or absurd part
             -- projects to garbage, so it is not drawn at all
@@ -1342,9 +1329,7 @@ local function drawPallets(camPos)
             local colour = e.ccol
             if not colour or e.cdropped ~= t.dropped
                 or e.cpal ~= CFG.palColour or e.cdown ~= CFG.palDownColour then
-                colour = t.dropped
-                    and lerpColor(CFG.palColour, CFG.palDownColour, 0.55)
-                    or CFG.palColour
+                colour = t.dropped and CFG.palDownColour or CFG.palColour
                 e.ccol, e.cdropped = colour, t.dropped
                 e.cpal, e.cdown = CFG.palColour, CFG.palDownColour
             end
@@ -2317,25 +2302,21 @@ local function refreshWorld()
 
     if not CFG.win then
         winList = {}
-        RT.winStack, RT.winNamed = nil, nil
     else
         local t = os.clock()
         if stamp ~= winScanStamp then
             winScanStamp = stamp
-            -- new map: throw the old walk away and start a fresh one
-            RT.winStack, RT.winNamed = nil, nil
-            winScanAt = t
+            winGeo = {}
+            winScanAt = 0
         end
-        if t >= winScanAt or RT.winStack then
+        -- one full pass a second, like the reference: cheap enough in the poll
+        -- loop, and a window is never missed because it streamed in late
+        if t >= winScanAt then
+            winScanAt = t + 1
             local found = collectWindows()
             if found then
-                winScanAt = t + 30
                 ensureSlots(winPool, math.min(#found, CFG.winPool), CFG.winThick, CFG.winText)
                 winList = found
-            elseif RT.winStack then
-                winScanAt = t          -- more chunks to walk: continue next pass
-            else
-                winScanAt = t + 10     -- map unreadable, back off
             end
         end
     end
