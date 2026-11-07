@@ -71,6 +71,7 @@ if not resolveCore() then
     -- instead; it re-runs the file once the game is readable.
     print("[swangy] game not attached yet - queued, it will start by itself")
     task.spawn(function()
+        local waited, told = 0, false
         while _G.__SWANGY_LOAD == loadToken do
             if resolveCore() then
                 local src
@@ -90,6 +91,25 @@ if not resolveCore() then
                     print("[swangy] deferred load: swangy.lua unreadable")
                 end
                 return
+            end
+            -- Six seconds is long past the second or two this VM needs right
+            -- after attaching. If it is still dark by then, say WHICH link is
+            -- missing: a game that is running but reports no services means the
+            -- executor is bound to the wrong DataModel (it showed one named
+            -- "Ugc" with zero children while the map was fully readable), and
+            -- no reload of this script can fix that -- the executor has to be
+            -- re-injected. Waiting quietly forever is what made that look like
+            -- a broken script.
+            waited = waited + 0.5
+            if not told and waited >= 6 then
+                told = true
+                local okG, kids = pcall(function() return #game:GetChildren() end)
+                pcall(print, string.format(
+                    "[swangy] still unattached after %.0fs: game children=%s Players=%s RunService=%s"
+                    .. " -- if all three are empty, Matcha is bound to the wrong DataModel:"
+                    .. " re-inject the executor, then reload",
+                    waited, tostring(okG and kids or "?"),
+                    tostring(Players ~= nil), tostring(RunService ~= nil)))
             end
             task.wait(0.5)
         end
