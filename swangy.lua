@@ -993,10 +993,6 @@ RT.walk = function(root, maxDepth, maxVisit, budget, test)
             if deadline and visited % 64 == 0 and os.clock() > deadline then return end
             local inst = kids[i]
             visited = visited + 1
-            -- a long walk is one synchronous block in this VM, and while it runs
-            -- nothing draws: yielding every 256 nodes keeps the overlay alive
-            -- instead of pausing it until the scan finishes
-            if visited % 256 == 0 then task.wait() end
             local cls, nm
             local okcn, cname, nname = pcall(RT.io.clsName, inst)
             if okcn then cls, nm = cname, nname end
@@ -1011,21 +1007,40 @@ RT.walk = function(root, maxDepth, maxVisit, budget, test)
 end
 
 -- windows
+-- The map is walked in chunks: a time budget handed back a partial list (which
+-- is why windows came and went) and one full pass blocks the frame. The stack
+-- lives on RT between calls, so every scan reaches the end, no call is long,
+-- and no yield happens inside the caller's pcall.
 local function collectWindows()
     local out = {}
     local map = Workspace:FindFirstChild("Map")
-    -- nil means "could not scan" so the caller keeps what it already has;
-    -- an empty table means the map genuinely has no windows
+    -- nil means "not finished / could not scan": the caller keeps what it has
     if not map then return nil end
-    -- the whole map, no depth cap: a window three models down was invisible at
-    -- depth 8, and the 40ms budget made the list depend on how far the walk got
-    -- before it was cut, which is why windows came and went
-    local named, visited = RT.walk(map, 32, 400000, 0, function(inst, cls, nm)
-        return nm ~= nil and lower(nm):find("window", 1, true) ~= nil
-    end)
-    if visited == 0 then return nil end
-    -- a walk that hit its safety cap is also partial: keep what is on screen
-    if visited >= 400000 then return nil end
+    if not RT.winStack then RT.winStack, RT.winNamed = { map }, {} end
+
+    local stack, named = RT.winStack, RT.winNamed
+    local seen = 0
+    while #stack > 0 and seen < 2000 do
+        local node = table.remove(stack)
+        seen = seen + 1
+        local okKids, kids = pcall(RT.io.children, node)
+        if okKids and type(kids) == "table" then
+            for i = 1, #kids do
+                local inst = kids[i]
+                local okc, cls, nm = pcall(RT.io.clsName, inst)
+                if okc then
+                    if nm and lower(nm):find("window", 1, true) then
+                        named[#named + 1] = inst
+                    end
+                    if cls == "Model" or cls == "Folder" then
+                        stack[#stack + 1] = inst
+                    end
+                end
+            end
+        end
+    end
+    if #stack > 0 then return nil end
+    RT.winStack, RT.winNamed = nil, nil
 
     local candidates = {}
     for _, d in ipairs(named) do
@@ -1069,7 +1084,15 @@ local function collectWindows()
     end
 
     for _, k in ipairs(candidates) do
-        if (not anyBottom) or lower(k.Name) == "bottom" then out[#out + 1] = entryFor(k) end
+        if (not anyBottom) or lower(k.Name) == "bottom" then
+            local e = entryFor(k)
+            -- same sanity limits as the reference: a zero-sized or absurd part
+            -- projects to garbage, so it is not drawn at all
+            if e and e.size and e.size.X >= 0.04 and e.size.Y >= 0.04 and e.size.Z >= 0.04
+                and e.size.X <= 200 and e.size.Y <= 200 and e.size.Z <= 200 then
+                out[#out + 1] = e
+            end
+        end
     end
     return out
 end
@@ -2294,18 +2317,25 @@ local function refreshWorld()
 
     if not CFG.win then
         winList = {}
+        RT.winStack, RT.winNamed = nil, nil
     else
         local t = os.clock()
-        if stamp ~= winScanStamp or t >= winScanAt then
+        if stamp ~= winScanStamp then
             winScanStamp = stamp
+            -- new map: throw the old walk away and start a fresh one
+            RT.winStack, RT.winNamed = nil, nil
+            winScanAt = t
+        end
+        if t >= winScanAt or RT.winStack then
             local found = collectWindows()
             if found then
                 winScanAt = t + 30
                 ensureSlots(winPool, math.min(#found, CFG.winPool), CFG.winThick, CFG.winText)
                 winList = found
+            elseif RT.winStack then
+                winScanAt = t          -- more chunks to walk: continue next pass
             else
-                -- one failed read used to wipe every window for the next 30s
-                winScanAt = t + 10
+                winScanAt = t + 10     -- map unreadable, back off
             end
         end
     end
@@ -2568,7 +2598,14 @@ function API.win.GetCount() return #winList end
 API.pal = {}
 function API.pal.SetEnabled(on)
     CFG.pal = on and true or false
-    if CFG.pal then pcall(refreshPallets) else palList = {} end
+    -- never scan inside a widget callback: this runs from the menu's own render
+    -- pass, and the scan blocks (and used to yield) there, freezing the whole UI.
+    -- Dropping the cached folder makes the background loop rescan on its next tick.
+    if CFG.pal then
+        palFolder, palIndex, palMisses = nil, {}, 0
+    else
+        palList = {}
+    end
     return CFG.pal
 end
 function API.pal.Toggle() return API.pal.SetEnabled(not CFG.pal) end
@@ -2623,7 +2660,7 @@ function API.fv.SetOption(key, value)
     else
         return false
     end
-    if CFG.fv then pcall(API.fv.Apply) end
+    if CFG.fv then RT.fvDirty = true end
     return true
 end
 
@@ -2634,9 +2671,10 @@ end
 
 function API.fv.SetEnabled(on)
     CFG.fv = on and true or false
-    if CFG.fv then return (API.fv.Apply()) end
-    API.fv.Restore()
-    return true, "off"
+    -- setgc sweeps the whole GC. Running that from the menu callback stalled the
+    -- UI until it finished, so the write is queued and done off the callback.
+    RT.fvDirty = true
+    return CFG.fv
 end
 
 function API.fv.Status()
@@ -2649,12 +2687,15 @@ task.spawn(function()
     while running do
         if CFG.fv then
             local now = os.clock()
-            if not RT.fvJob or RT.fvJob ~= tostring(game.JobId)
+            if RT.fvDirty or not RT.fvJob or RT.fvJob ~= tostring(game.JobId)
                 or (RT.fvAppliedAt or 0) == 0 or (now - RT.fvAppliedAt) > 20 then
+                RT.fvDirty = nil
                 pcall(API.fv.Apply)
             end
+        elseif (RT.fvAppliedAt or 0) > 0 then
+            pcall(API.fv.Restore)
         end
-        task.wait(5)
+        task.wait(0.5)
     end
 end)
 
