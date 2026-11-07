@@ -3423,7 +3423,7 @@ HUD.baseline = {
     unhookspeed = true, healnerf = true, bleedboost = true,
     vaultspeed = true, skillcheckfrequency = true, Sprinting = true,
     IsChased = true, chasereward = true, ChaseCount = true,
-    repairing = true, Parry = true, RemainingCarryTime = true,
+    repairing = true, RemainingCarryTime = true,
     HookProgressDepleting = true, HealProgress = true, Crouching = true,
     Crouchingserver = true, HealingPaused = true, isvaulting = true,
     vaultending = true, Untargettable = true, anticamp = true,
