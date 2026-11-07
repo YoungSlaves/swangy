@@ -2556,7 +2556,9 @@ end)
 
 task.spawn(function()
     while running do
+        RT.busy = "skillcheck"
         local ok, err = pcall(scStep)
+        RT.busy = nil
         if not ok then
             scReleaseInput()
             scTrack = {}
@@ -2683,17 +2685,33 @@ function API.fv.Status()
     return (RT.fvAppliedAt or 0) > 0 and "on" or "pending"
 end
 
+-- The GC write is never repeated on a timer. setgc sweeps the whole GC and
+-- measured 25-40s in this VM, so re-applying it every 20s froze the game on a
+-- loop and read as "paused during idle". It now runs only when the option
+-- changes, on a new server, or after a failed write -- and it is labelled so a
+-- stall can name it.
 task.spawn(function()
     while running do
+        local job = tostring(game.JobId)
         if CFG.fv then
-            local now = os.clock()
-            if RT.fvDirty or not RT.fvJob or RT.fvJob ~= tostring(game.JobId)
-                or (RT.fvAppliedAt or 0) == 0 or (now - RT.fvAppliedAt) > 20 then
+            if RT.fvDirty or RT.fvJob ~= job or (RT.fvAppliedAt or 0) == 0 then
                 RT.fvDirty = nil
-                pcall(API.fv.Apply)
+                RT.busy = "fast vault gc"
+                local t0 = os.clock()
+                local ok, msg = API.fv.Apply()
+                local took = os.clock() - t0
+                RT.busy = nil
+                if took > 2 and not RT.fvSlow then
+                    RT.fvSlow = true
+                    pcall(print, string.format(
+                        "[swangy] fast vault: GC write took %.1fs, that is the stall", took))
+                end
+                if not ok and msg then pcall(print, "[swangy] fast vault: " .. tostring(msg)) end
             end
         elseif (RT.fvAppliedAt or 0) > 0 then
+            RT.busy = "fast vault gc"
             pcall(API.fv.Restore)
+            RT.busy = nil
         end
         task.wait(0.5)
     end
@@ -4542,7 +4560,9 @@ task.spawn(function()
         local tok = _G.__SWANGY_LOAD
         if tok ~= nil and tok ~= loadToken then break end
         _G.__SWANGY_LOAD = loadToken
+        RT.busy = "hud"
         local ok, err = pcall(HUD.tick)
+        RT.busy = nil
         if not ok then HUD.lastError = tostring(err) end
         task.wait(ok and (HUD.drag and 1 / 60 or (CFG.hud and 0.08 or 0.25)) or 0.5)
     end
