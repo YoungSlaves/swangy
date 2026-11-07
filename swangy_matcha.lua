@@ -766,25 +766,44 @@ local function collectGens()
     local map = Workspace:FindFirstChild("Map")
     if not map then return out end
 
-    local folder
     local okKids, kids = pcall(RT.io.children, map)
     if not okKids or type(kids) ~= "table" then okKids, kids = false, {} end
 
-    local parents = { kids }
-    local okRes, res = pcall(RT.io.find, map, "resources")
-    if okRes and res then
-        local okSub, sub = pcall(RT.io.children, res)
-        if okSub and type(sub) == "table" then parents[#parents + 1] = sub end
+    -- the folder found on this map is remembered. Re-searching every cycle was
+    -- the expensive path, and a different map keeps its generators somewhere
+    -- else, so the cache is only trusted while the folder is still alive under
+    -- this map -- a new round destroys it and the search runs again.
+    local folder = RT.genFolder
+    if folder then
+        local okP, parent = pcall(function() return folder.Parent end)
+        local okC, cached = pcall(RT.io.children, folder)
+        if not okP or parent == nil or not okC
+            or type(cached) ~= "table" or #cached == 0 then
+            folder, RT.genFolder = nil, nil
+        end
     end
 
-    for _, list in ipairs(parents) do
-        if folder then break end
-        for _, ch in ipairs(list) do
-            local n = lower(ch.Name)
-            if ch.ClassName == "Folder"
-                and (n:find("generator", 1, true) or n:find("gens", 1, true)) then
-                local okSub, sub = pcall(RT.io.children, ch)
-                if okSub and type(sub) == "table" and #sub > 0 then folder = ch break end
+    if not folder then
+        local parents = { kids }
+        local okRes, res = pcall(RT.io.find, map, "resources")
+        if okRes and res then
+            local okSub, sub = pcall(RT.io.children, res)
+            if okSub and type(sub) == "table" then parents[#parents + 1] = sub end
+        end
+
+        for _, list in ipairs(parents) do
+            if folder then break end
+            for _, ch in ipairs(list) do
+                local n = lower(ch.Name)
+                if ch.ClassName == "Folder"
+                    and (n:find("generator", 1, true) or n:find("gens", 1, true)) then
+                    local okSub, sub = pcall(RT.io.children, ch)
+                    if okSub and type(sub) == "table" and #sub > 0 then
+                        folder = ch
+                        RT.genFolder = ch
+                        break
+                    end
+                end
             end
         end
     end
@@ -2236,6 +2255,8 @@ local function refreshWorld()
     end
     if stamp ~= genStamp then
         genStamp = stamp
+        -- every round looks again: maps do not agree on where generators live
+        RT.genFolder = nil
         genGeo = {}
         winGeo = {}
         palGeo = {}
