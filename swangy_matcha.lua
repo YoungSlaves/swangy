@@ -979,14 +979,18 @@ local winPool, winList, winGeo = {}, {}, {}
 -- are read once and guarded: the map streams, so a child handed back by
 -- GetChildren can already be gone by the time it is touched.
 RT.walk = function(root, maxDepth, maxVisit, budget, test)
-    local hits, visited, deadline = {}, 0, os.clock() + budget
+    -- budget <= 0 walks the whole tree. A time-sliced walk hands back whatever
+    -- it reached before the clock ran out, and a partial list of windows is
+    -- worse than a slow one: the caller cannot tell it from a real answer.
+    local hits, visited = {}, 0
+    local deadline = (budget and budget > 0) and (os.clock() + budget) or nil
     local function step(container, depth)
-        if visited >= maxVisit or os.clock() > deadline then return end
+        if visited >= maxVisit or (deadline and os.clock() > deadline) then return end
         local ok, kids = pcall(RT.io.children, container)
         if not ok or type(kids) ~= "table" then return end
         for i = 1, #kids do
             if visited >= maxVisit then return end
-            if visited % 64 == 0 and os.clock() > deadline then return end
+            if deadline and visited % 64 == 0 and os.clock() > deadline then return end
             local inst = kids[i]
             visited = visited + 1
             -- a long walk is one synchronous block in this VM, and while it runs
@@ -1013,10 +1017,15 @@ local function collectWindows()
     -- nil means "could not scan" so the caller keeps what it already has;
     -- an empty table means the map genuinely has no windows
     if not map then return nil end
-    local named, visited = RT.walk(map, 8, 60000, 0.04, function(inst, cls, nm)
+    -- the whole map, no depth cap: a window three models down was invisible at
+    -- depth 8, and the 40ms budget made the list depend on how far the walk got
+    -- before it was cut, which is why windows came and went
+    local named, visited = RT.walk(map, 32, 400000, 0, function(inst, cls, nm)
         return nm ~= nil and lower(nm):find("window", 1, true) ~= nil
     end)
     if visited == 0 then return nil end
+    -- a walk that hit its safety cap is also partial: keep what is on screen
+    if visited >= 400000 then return nil end
 
     local candidates = {}
     for _, d in ipairs(named) do
