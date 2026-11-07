@@ -808,7 +808,8 @@ local function collectGens()
     if folder then
         local ok, items = pcall(RT.io.children, folder)
         if ok then
-            for _, m in ipairs(items) do
+            for mi, m in ipairs(items) do
+                if mi % 32 == 0 then task.wait() end
                 if attrNum(m, "RepairProgress") or attrNum(m, "PlayersRepairingCount")
                     or attrNum(m, "Progress") then
                     note(m)
@@ -819,7 +820,9 @@ local function collectGens()
     end
 
     if not okKids then return out end
-    for _, ch in ipairs(kids) do
+    for idx = 1, #kids do
+        local ch = kids[idx]
+        if idx % 64 == 0 then task.wait() end
         if attrNum(ch, "RepairProgress") or attrNum(ch, "PlayersRepairingCount") then
             note(ch)
         else
@@ -982,6 +985,10 @@ RT.walk = function(root, maxDepth, maxVisit, budget, test)
             if visited % 64 == 0 and os.clock() > deadline then return end
             local inst = kids[i]
             visited = visited + 1
+            -- a long walk is one synchronous block in this VM, and while it runs
+            -- nothing draws: yielding every 256 nodes keeps the overlay alive
+            -- instead of pausing it until the scan finishes
+            if visited % 256 == 0 then task.wait() end
             local cls, nm
             local okcn, cname, nname = pcall(RT.io.clsName, inst)
             if okcn then cls, nm = cname, nname end
@@ -1002,7 +1009,7 @@ local function collectWindows()
     -- nil means "could not scan" so the caller keeps what it already has;
     -- an empty table means the map genuinely has no windows
     if not map then return nil end
-    local named, visited = RT.walk(map, 8, 60000, 0.12, function(inst, cls, nm)
+    local named, visited = RT.walk(map, 8, 60000, 0.04, function(inst, cls, nm)
         return nm ~= nil and lower(nm):find("window", 1, true) ~= nil
     end)
     if visited == 0 then return nil end
@@ -1209,7 +1216,8 @@ local function collectPallets()
 
     local list, newIndex = {}, {}
     local now = os.clock()
-    for _, model in ipairs(items) do
+    for pi, model in ipairs(items) do
+        if pi % 16 == 0 then task.wait() end
         local modelKey = palletAddress(model)
         local parts = modelKey and palParts[modelKey]
         if not parts then
@@ -2266,7 +2274,7 @@ local function refreshWorld()
         end
         ensureSlots(genPool, math.min(#kept, CFG.genPool), CFG.genThick, CFG.genText)
         genList = kept
-        if not kept[1] then genDiscoverAt = os.clock() + 1.5 end
+        if not kept[1] then genDiscoverAt = os.clock() + 6 end
     end
 
     if not CFG.win then
@@ -2282,7 +2290,7 @@ local function refreshWorld()
                 winList = found
             else
                 -- one failed read used to wipe every window for the next 30s
-                winScanAt = t + 2
+                winScanAt = t + 10
             end
         end
     end
@@ -2409,6 +2417,17 @@ task.spawn(function()
     while running do
         task.wait(0.5)
         local now = os.clock()
+        -- a gap between ticks is the pause itself; record how long it lasted and
+        -- what the script was doing, so the next one can be named
+        local gap = (RT.beat or 0) > 0 and (now - RT.beat) or 0
+        if gap > 0.5 and not RT.stallOpen then
+            RT.stallOpen, RT.stallAt, RT.stallDuring = true, RT.beat, RT.busy
+        elseif gap <= 0.5 and RT.stallOpen then
+            RT.stallOpen = false
+            RT.lastStall = { gap = now - RT.stallAt, during = RT.stallDuring or "idle" }
+            pcall(print, string.format("[swangy] overlay paused %.2fs during %s",
+                RT.lastStall.gap, RT.lastStall.during))
+        end
         if (RT.beat or 0) > 0 and now - RT.beat > 1.5
             and now - (RT.lastReconnect or 0) > 2 then
             RT.lastReconnect = now
@@ -2439,7 +2458,9 @@ task.spawn(function()
         -- stale and the overlay kept projecting it, which is the frozen ESP with
         -- a HUD that still shows the last numbers it read.
         if RT.isLoaded() and (now >= scBusyUntil or now - last > 1.5) then
+            RT.busy = "world scan"
             pcall(refreshWorld)
+            RT.busy = nil
             last = now
         end
         task.wait(1 / CFG.pollHz)
@@ -2449,22 +2470,33 @@ end)
 local genPollHz = 10
 task.spawn(function()
     while running do
-        if (CFG.gen or (CFG.hud and CFG.hudGens)) and genList[1] then pcall(updateGenStates, genList) end
+        if (CFG.gen or (CFG.hud and CFG.hudGens)) and genList[1] then
+            RT.busy = "gen state"
+            pcall(updateGenStates, genList)
+            RT.busy = nil
+        end
         task.wait(1 / genPollHz)
     end
 end)
 
 task.spawn(function()
     while running do
-        if RT.isLoaded() and os.clock() >= scBusyUntil then pcall(refreshPallets) end
-        task.wait(1 / CFG.palHz)
+        if RT.isLoaded() and os.clock() >= scBusyUntil then
+            RT.busy = "pallet scan"
+            pcall(refreshPallets)
+            RT.busy = nil
+        end
+        -- a scan costing more than 8ms gets halved instead of repeated
+        task.wait(palScanMs > 8 and 0.25 or (1 / CFG.palHz))
     end
 end)
 
 task.spawn(function()
     while running do
         if CFG.trap or (CFG.hud and CFG.hudTraps) then
+            RT.busy = "trap scan"
             local ok, list = pcall(collectTraps)
+            RT.busy = nil
             if ok and list then
                 ensureSlots(trapPool, math.min(#list, CFG.trapPool), CFG.trapThick, CFG.trapText)
                 trapList = list
@@ -2685,6 +2717,7 @@ function API.Health()
         renderAge  = (RT.beat or 0) > 0 and (now - RT.beat) or -1,
         reconnects = RT.reconnects or 0,
         scBusyFor  = math.max(0, (scBusyUntil or 0) - now),
+        stall      = RT.lastStall and string.format("%.2fs %s", RT.lastStall.gap, RT.lastStall.during) or "none",
         scErrors   = scStats.errors,
         drawHz     = CFG.drawHz,
         renderMs   = renderMs,

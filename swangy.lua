@@ -1,7 +1,6 @@
 -- swangy
 -- esp: generators, windows, pallets, bear traps
 -- skillcheck: generators and the butcher trap
--- cut: no auto parry, no pumpkin esp
 -- aimbot: veil spear throw assist
 -- hud: killer timers, generator column, survivor list
 -- menu: swangy ui by aphalia (github.com/YoungSlaves/matchaUI)
@@ -147,6 +146,7 @@ local CFG = {
     trapArmedColour  = Color3.fromRGB(80, 255, 120),
     trapSprungColour = Color3.fromRGB(255, 60, 60),
 
+
     names     = true,
     namesOnly = false,   -- draw labels without the boxes
     espRange  = 1000,
@@ -184,6 +184,22 @@ local CFG = {
     vaDotTrans    = 0,    -- 0 solid .. 100 invisible, Drawing transparency percent
     vaCrossSize   = 7,    -- arm length of the centre crosshair, pixels
     vaCrossColour = Color3.fromRGB(255, 255, 255),
+
+    pp           = false,
+    ppRange      = 14,
+    ppMinRange   = 13,
+    ppPing       = true,
+    ppFacing     = true,
+    ppAim        = true,
+    ppVault      = true,   -- a killer vault also moves AC_AllowedSpeed into the swing band
+    ppHealth     = 50,
+    ppInterval   = 0.45,
+    ppEquip      = true,
+    ppEquipRange = 45,
+    ppWindup     = true,
+    ppWindupHz   = 120,
+    ppScanRange  = 70,
+    ppHz         = 120,
 
     fv        = false,   -- always fast vault, game's own SurvivorVault rules
     fvDist     = 0,      -- max approach distance in studs, 0 = any
@@ -259,7 +275,7 @@ end
 RT.safe = function()
     if _G.__SWANGY_SAFE ~= true then return end
     CFG.gen, CFG.win, CFG.pal, CFG.trap = false, false, false, false
-    CFG.hud, CFG.sc, CFG.va, CFG.names = false, false, false, false
+    CFG.hud, CFG.sc, CFG.pp, CFG.va, CFG.names = false, false, false, false, false
 end
 RT.safe()
 
@@ -792,7 +808,8 @@ local function collectGens()
     if folder then
         local ok, items = pcall(RT.io.children, folder)
         if ok then
-            for _, m in ipairs(items) do
+            for mi, m in ipairs(items) do
+                if mi % 32 == 0 then task.wait() end
                 if attrNum(m, "RepairProgress") or attrNum(m, "PlayersRepairingCount")
                     or attrNum(m, "Progress") then
                     note(m)
@@ -803,7 +820,9 @@ local function collectGens()
     end
 
     if not okKids then return out end
-    for _, ch in ipairs(kids) do
+    for idx = 1, #kids do
+        local ch = kids[idx]
+        if idx % 64 == 0 then task.wait() end
         if attrNum(ch, "RepairProgress") or attrNum(ch, "PlayersRepairingCount") then
             note(ch)
         else
@@ -966,6 +985,10 @@ RT.walk = function(root, maxDepth, maxVisit, budget, test)
             if visited % 64 == 0 and os.clock() > deadline then return end
             local inst = kids[i]
             visited = visited + 1
+            -- a long walk is one synchronous block in this VM, and while it runs
+            -- nothing draws: yielding every 256 nodes keeps the overlay alive
+            -- instead of pausing it until the scan finishes
+            if visited % 256 == 0 then task.wait() end
             local cls, nm
             local okcn, cname, nname = pcall(RT.io.clsName, inst)
             if okcn then cls, nm = cname, nname end
@@ -986,7 +1009,7 @@ local function collectWindows()
     -- nil means "could not scan" so the caller keeps what it already has;
     -- an empty table means the map genuinely has no windows
     if not map then return nil end
-    local named, visited = RT.walk(map, 8, 60000, 0.12, function(inst, cls, nm)
+    local named, visited = RT.walk(map, 8, 60000, 0.04, function(inst, cls, nm)
         return nm ~= nil and lower(nm):find("window", 1, true) ~= nil
     end)
     if visited == 0 then return nil end
@@ -1193,7 +1216,8 @@ local function collectPallets()
 
     local list, newIndex = {}, {}
     local now = os.clock()
-    for _, model in ipairs(items) do
+    for pi, model in ipairs(items) do
+        if pi % 16 == 0 then task.wait() end
         local modelKey = palletAddress(model)
         local parts = modelKey and palParts[modelKey]
         if not parts then
@@ -2250,7 +2274,7 @@ local function refreshWorld()
         end
         ensureSlots(genPool, math.min(#kept, CFG.genPool), CFG.genThick, CFG.genText)
         genList = kept
-        if not kept[1] then genDiscoverAt = os.clock() + 1.5 end
+        if not kept[1] then genDiscoverAt = os.clock() + 6 end
     end
 
     if not CFG.win then
@@ -2266,7 +2290,7 @@ local function refreshWorld()
                 winList = found
             else
                 -- one failed read used to wipe every window for the next 30s
-                winScanAt = t + 2
+                winScanAt = t + 10
             end
         end
     end
@@ -2393,6 +2417,17 @@ task.spawn(function()
     while running do
         task.wait(0.5)
         local now = os.clock()
+        -- a gap between ticks is the pause itself; record how long it lasted and
+        -- what the script was doing, so the next one can be named
+        local gap = (RT.beat or 0) > 0 and (now - RT.beat) or 0
+        if gap > 0.5 and not RT.stallOpen then
+            RT.stallOpen, RT.stallAt, RT.stallDuring = true, RT.beat, RT.busy
+        elseif gap <= 0.5 and RT.stallOpen then
+            RT.stallOpen = false
+            RT.lastStall = { gap = now - RT.stallAt, during = RT.stallDuring or "idle" }
+            pcall(print, string.format("[swangy] overlay paused %.2fs during %s",
+                RT.lastStall.gap, RT.lastStall.during))
+        end
         if (RT.beat or 0) > 0 and now - RT.beat > 1.5
             and now - (RT.lastReconnect or 0) > 2 then
             RT.lastReconnect = now
@@ -2423,7 +2458,9 @@ task.spawn(function()
         -- stale and the overlay kept projecting it, which is the frozen ESP with
         -- a HUD that still shows the last numbers it read.
         if RT.isLoaded() and (now >= scBusyUntil or now - last > 1.5) then
+            RT.busy = "world scan"
             pcall(refreshWorld)
+            RT.busy = nil
             last = now
         end
         task.wait(1 / CFG.pollHz)
@@ -2433,22 +2470,33 @@ end)
 local genPollHz = 10
 task.spawn(function()
     while running do
-        if (CFG.gen or (CFG.hud and CFG.hudGens)) and genList[1] then pcall(updateGenStates, genList) end
+        if (CFG.gen or (CFG.hud and CFG.hudGens)) and genList[1] then
+            RT.busy = "gen state"
+            pcall(updateGenStates, genList)
+            RT.busy = nil
+        end
         task.wait(1 / genPollHz)
     end
 end)
 
 task.spawn(function()
     while running do
-        if RT.isLoaded() and os.clock() >= scBusyUntil then pcall(refreshPallets) end
-        task.wait(1 / CFG.palHz)
+        if RT.isLoaded() and os.clock() >= scBusyUntil then
+            RT.busy = "pallet scan"
+            pcall(refreshPallets)
+            RT.busy = nil
+        end
+        -- a scan costing more than 8ms gets halved instead of repeated
+        task.wait(palScanMs > 8 and 0.25 or (1 / CFG.palHz))
     end
 end)
 
 task.spawn(function()
     while running do
         if CFG.trap or (CFG.hud and CFG.hudTraps) then
+            RT.busy = "trap scan"
             local ok, list = pcall(collectTraps)
+            RT.busy = nil
             if ok and list then
                 ensureSlots(trapPool, math.min(#list, CFG.trapPool), CFG.trapThick, CFG.trapText)
                 trapList = list
@@ -2521,79 +2569,13 @@ end
 function API.trap.Toggle() return API.trap.SetEnabled(not CFG.trap) end
 function API.trap.SetRange(v) CFG.trapRange = math.max(1, tonumber(v) or CFG.trapRange) end
 function API.trap.GetCount() return #trapList end
-
-function API.trap.GetStates()
-    local out = {}
-    for i = 1, #trapList do
-        local t = trapList[i]
-        out[i] = { armed = t.armed, victim = trapVictim(t), pos = t.pos }
-    end
-    return out
-end
-function API.pal.GetStates()
-    local out = {}
-    for i = 1, #palList do out[i] = { dropped = palList[i].dropped, pos = palList[i].pos } end
-    return out
-end
-
-API.sc = {}
-function API.sc.SetEnabled(on)
-    CFG.sc = on and true or false
-    if not CFG.sc then scReleaseInput(); scTrack = {} end
-    return CFG.sc
-end
-function API.sc.Toggle() return API.sc.SetEnabled(not CFG.sc) end
-function API.sc.SetLead(v) CFG.scLead = math.clamp(tonumber(v) or CFG.scLead, 0, 12) end
-function API.sc.SetRescue(on) CFG.scRescue = on and true or false; return CFG.scRescue end
-function API.sc.SetDryRun(on) CFG.scDry = on and true or false; return CFG.scDry end
-function API.sc.SetMode(mode)
-    if mode == "gen" or mode == "trap" then CFG.scMode = mode else CFG.scMode = nil end
-    return CFG.scMode
-end
-function API.sc.Stats()
-    local p = scTrack.pending
-    scStats.pending = p and string.format("+%.0fms", math.max(0, (p.at - os.clock()) * 1000)) or nil
-    return scStats
-end
-
-function API.SetFill(gen, win, pal)
-    if gen ~= nil then CFG.genFill = gen and true or false end
-    if win ~= nil then CFG.winFill = win and true or false end
-    if pal ~= nil then CFG.palFill = pal and true or false end
-    return CFG.genFill, CFG.winFill, CFG.palFill
-end
-
-function API.SetDrawHz(hz)
-    CFG.drawHz = math.max(0, tonumber(hz) or 0)
-    return CFG.drawHz
-end
-
-function API.GetConfig()
-    return {
-        gen = CFG.gen, win = CFG.win, pal = CFG.pal, trap = CFG.trap,
-        names = CFG.names, namesOnly = CFG.namesOnly,
-        range = CFG.genRange,
-        winColour = CFG.winColour, palColour = CFG.palColour,
-        trapArmedColour = CFG.trapArmedColour, trapSprungColour = CFG.trapSprungColour,
-        genIdleColour = CFG.genIdleColour, genDoneColour = CFG.genDoneColour,
-        genBrokenColour = CFG.genBrokenColour,
-        sc = CFG.sc, hum = CFG.scHum, humMin = CFG.scHumMin, humMax = CFG.scHumMax,
-        react = CFG.scReact, delay = CFG.scDelay,
-        va = CFG.va, vaFov = CFG.vaFov, vaRange = CFG.vaRange, vaSmooth = CFG.vaSmooth,
-        vaSticky = CFG.vaSticky, vaLead = CFG.vaLead, vaLos = CFG.vaLos, vaHold = CFG.vaHold,
-        vaAimHeight = CFG.vaAimHeight, vaPlacement = CFG.vaPlacement, kbw = CFG.kbw,
-        hud = CFG.hud, hudAlpha = CFG.hudAlpha, hudGens = CFG.hudGens,
-        hudTraps = CFG.hudTraps, hudSurvivors = CFG.hudSurvivors,
-        ui = UI ~= nil,
-    }
-end
-
 -- Always fast vault: the controller asks SurvivorVault.evaluate for a tier from
 -- recent movement samples and sends it with the normal vault request. Those
 -- rules are plain numbers, so rewriting them makes the game itself call a
 -- sprinting vault fast -- nothing is spoofed and no velocity is written.
--- Matcha's setgc rewrites named GC values with no address resolution, so this
--- is one atomic call instead of a findgc/applygc address cache.
+-- Matcha's setgc rewrites named GC values with no address resolution, which is
+-- why it is used here instead of a findgc/applygc cache (that form needs the
+-- module resolved by address and Unsafe LuaU enabled).
 RT.fvFast = RT.fvFast or { DISTANCE = 0, REPEAT_DISTANCE = 0, DOT = -1, MIN_SPEED = -1 }
 RT.fvSlow = RT.fvSlow or { DISTANCE = 3, REPEAT_DISTANCE = 3.5, DOT = 0.7071067811865476, MIN_SPEED = 12.5 }
 RT.fvAppliedAt = RT.fvAppliedAt or 0
@@ -2661,6 +2643,72 @@ task.spawn(function()
     end
 end)
 
+function API.trap.GetStates()
+    local out = {}
+    for i = 1, #trapList do
+        local t = trapList[i]
+        out[i] = { armed = t.armed, victim = trapVictim(t), pos = t.pos }
+    end
+    return out
+end
+function API.pal.GetStates()
+    local out = {}
+    for i = 1, #palList do out[i] = { dropped = palList[i].dropped, pos = palList[i].pos } end
+    return out
+end
+
+API.sc = {}
+function API.sc.SetEnabled(on)
+    CFG.sc = on and true or false
+    if not CFG.sc then scReleaseInput(); scTrack = {} end
+    return CFG.sc
+end
+function API.sc.Toggle() return API.sc.SetEnabled(not CFG.sc) end
+function API.sc.SetLead(v) CFG.scLead = math.clamp(tonumber(v) or CFG.scLead, 0, 12) end
+function API.sc.SetRescue(on) CFG.scRescue = on and true or false; return CFG.scRescue end
+function API.sc.SetDryRun(on) CFG.scDry = on and true or false; return CFG.scDry end
+function API.sc.SetMode(mode)
+    if mode == "gen" or mode == "trap" then CFG.scMode = mode else CFG.scMode = nil end
+    return CFG.scMode
+end
+function API.sc.Stats()
+    local p = scTrack.pending
+    scStats.pending = p and string.format("+%.0fms", math.max(0, (p.at - os.clock()) * 1000)) or nil
+    return scStats
+end
+
+function API.SetFill(gen, win, pal)
+    if gen ~= nil then CFG.genFill = gen and true or false end
+    if win ~= nil then CFG.winFill = win and true or false end
+    if pal ~= nil then CFG.palFill = pal and true or false end
+    return CFG.genFill, CFG.winFill, CFG.palFill
+end
+
+function API.SetDrawHz(hz)
+    CFG.drawHz = math.max(0, tonumber(hz) or 0)
+    return CFG.drawHz
+end
+
+function API.GetConfig()
+    return {
+        gen = CFG.gen, win = CFG.win, pal = CFG.pal, trap = CFG.trap,
+        names = CFG.names, namesOnly = CFG.namesOnly,
+        range = CFG.genRange,
+        winColour = CFG.winColour, palColour = CFG.palColour,
+        trapArmedColour = CFG.trapArmedColour, trapSprungColour = CFG.trapSprungColour,
+        genIdleColour = CFG.genIdleColour, genDoneColour = CFG.genDoneColour,
+        genBrokenColour = CFG.genBrokenColour,
+        sc = CFG.sc, hum = CFG.scHum, humMin = CFG.scHumMin, humMax = CFG.scHumMax,
+        react = CFG.scReact, delay = CFG.scDelay,
+        va = CFG.va, vaFov = CFG.vaFov, vaRange = CFG.vaRange, vaSmooth = CFG.vaSmooth,
+        vaSticky = CFG.vaSticky, vaLead = CFG.vaLead, vaLos = CFG.vaLos, vaHold = CFG.vaHold,
+        vaAimHeight = CFG.vaAimHeight, vaPlacement = CFG.vaPlacement, kbw = CFG.kbw,
+        hud = CFG.hud, hudAlpha = CFG.hudAlpha, hudGens = CFG.hudGens,
+        hudTraps = CFG.hudTraps, hudSurvivors = CFG.hudSurvivors,
+        ui = UI ~= nil,
+    }
+end
+
 -- what the overlay is doing right now, so a freeze can be identified instead of
 -- described: renderAge is the age of the last RenderStepped tick
 function API.Health()
@@ -2669,6 +2717,7 @@ function API.Health()
         renderAge  = (RT.beat or 0) > 0 and (now - RT.beat) or -1,
         reconnects = RT.reconnects or 0,
         scBusyFor  = math.max(0, (scBusyUntil or 0) - now),
+        stall      = RT.lastStall and string.format("%.2fs %s", RT.lastStall.gap, RT.lastStall.during) or "none",
         scErrors   = scStats.errors,
         drawHz     = CFG.drawHz,
         renderMs   = renderMs,
@@ -3302,6 +3351,507 @@ task.spawn(function()
         task.wait((CFG.va and isKiller) and (1 / 144) or 0.1)
     end
 end)
+
+-- parry: replicated windup attributes -> simulated right click
+--
+-- Every value here was measured live in this game on 2026-10-29, and each
+-- one replaced something that did not work:
+--   * the swing is LowerBodyStabilize + AC_AllowedSpeed in 20..40. The band
+--     appears a poll BEFORE the stab flag, so the band alone is the trigger.
+--     ac=nil and ac=3.62 locks exist and are rejected by the band.
+--   * Players:GetPlayers and Players:GetChildren return empty mid-round, so
+--     killers are found in Workspace by attributes only a killer carries.
+--   * LocalPlayer's wrapper goes stale and CameraSubject is often a
+--     CameraBlock Part, so your character is found by attributes only the
+--     local client writes.
+--   * the client cooldown token caches stale addresses and blocked five real
+--     presses in a row, so it is not consulted at all. A press with the
+--     dagger down is refused by the game at no cost.
+--   * the press is mouse2click. No remote is ever sent.
+--   * the whole gate set is cached at 5 Hz: eleven GetAttribute reads on the
+--     press path measured as the reason a press landed too late.
+local PARRY = {
+    state = "Disabled", reason = nil, error = nil, denied = nil,
+    presses = 0, lands = 0, scans = 0,
+    lastPress = -100, lastCollect = 0, lastWindup = 0,
+    targets = {}, gate = { ok = false, reason = "starting", at = -1 },
+    charCache = nil, charAt = -1, rootCache = nil, rootAt = -1,
+}
+
+-- Attributes only a KILLER character carries. Stalking is deliberately out:
+-- a survivor was measured carrying Stalking=false.
+local PP_KILLER_ATTRS = {
+    "TerrorRadius", "ChaseTargetUserId", "BloodLust",
+    "MorphedKiller", "Butcher", "Beartraps",
+}
+-- Attributes written by scripts on YOUR client only. Verified against the
+-- killer and another survivor, whose lists contain none of them.
+local PP_SELF_ATTRS = {
+    "ParrySpent", "ParryLands", "Parry",
+    "RoundScriptsActive", "overridelookscript", "nogui",
+}
+
+PARRY.actions = { "action", "isVaulting", "isSliding", "isDroppingPallet",
+    "isRepairing", "isHealing", "isUnhooking", "isExiting" }
+-- Vault flags on the KILLER. A vault moves AC_AllowedSpeed into the swing
+-- band, so the band alone fires a parry at a vault and burns the attempt.
+-- A missing attribute reads nil and changes nothing.
+PARRY.vault = { "isVaulting", "IsVaulting", "Vaulting", "vaultending" }
+PARRY.blocked = { "Knocked", "IsHooked", "IsCarried", "IsDead", "Trapped" }
+
+function PARRY.addr(inst)
+    if not inst then return nil end
+    local ok, a = pcall(RT.io.address, inst)
+    if ok and type(a) == "number" and a ~= 0 then return tostring(a) end
+    return tostring(inst)
+end
+
+function PARRY.same(a, b)
+    if not a or not b then return false end
+    local x, y = PARRY.addr(a), PARRY.addr(b)
+    if x and y and x == y then return true end
+    local n1, n2 = nil, nil
+    pcall(function() n1 = a.Name end)
+    pcall(function() n2 = b.Name end)
+    return n1 ~= nil and n1 == n2
+end
+
+-- Your character, without Players and without trusting the camera subject.
+function PARRY.myChar()
+    local now = os.clock()
+    if PARRY.charCache and now - PARRY.charAt < 0.5 and PARRY.charCache.Parent then
+        return PARRY.charCache
+    end
+    PARRY.charAt = now
+    local prev = PARRY.charCache
+    PARRY.charCache = nil
+
+    local cam = nil
+    pcall(function() cam = Workspace.CurrentCamera end)
+    if cam then
+        local subj = nil
+        pcall(function() subj = cam.CameraSubject end)
+        if subj then
+            local model = nil
+            pcall(function()
+                model = subj.Parent
+                if model and model.ClassName ~= "Model" then model = model.Parent end
+            end)
+            if model and model.ClassName == "Model" then PARRY.charCache = model end
+        end
+    end
+
+    if not PARRY.charCache and lp then
+        local okP, ch = pcall(function() return lp.Character end)
+        if okP and ch then PARRY.charCache = ch end
+    end
+
+    if not PARRY.charCache then
+        local ok, kids = pcall(function() return Workspace:GetChildren() end)
+        if ok and type(kids) == "table" then
+            local camPos = nil
+            pcall(function() camPos = Workspace.CurrentCamera.CFrame.Position end)
+            local best, bestD = nil, nil
+            for i = 1, #kids do
+                local m = kids[i]
+                if m.ClassName == "Model" then
+                    local hum = nil
+                    pcall(function() hum = m:FindFirstChildOfClass("Humanoid") end)
+                    if hum then
+                        local mine = false
+                        for j = 1, #PP_SELF_ATTRS do
+                            local v = nil
+                            pcall(function() v = m:GetAttribute(PP_SELF_ATTRS[j]) end)
+                            if v ~= nil then mine = true break end
+                        end
+                        if mine then
+                            PARRY.charCache = m
+                            break
+                        end
+                        local root = nil
+                        pcall(function() root = m:FindFirstChild("HumanoidRootPart") end)
+                        if root and camPos then
+                            local d = nil
+                            pcall(function() d = (root.Position - camPos).Magnitude end)
+                            if d and d < 6 and (not bestD or d < bestD) then best, bestD = m, d end
+                        end
+                    end
+                end
+            end
+            if not PARRY.charCache and best then PARRY.charCache = best end
+        end
+    end
+
+    if not PARRY.charCache and prev then
+        local alive = false
+        pcall(function() alive = prev.Parent ~= nil end)
+        if alive then PARRY.charCache = prev end
+    end
+    return PARRY.charCache
+end
+
+function PARRY.myRoot()
+    local now = os.clock()
+    if PARRY.rootCache and now - PARRY.rootAt < 0.25 and PARRY.rootCache.Parent then
+        return PARRY.rootCache
+    end
+    PARRY.rootAt = now
+    PARRY.rootCache = nil
+    local ch = PARRY.myChar()
+    if ch then
+        local ok, root = pcall(function() return ch:FindFirstChild("HumanoidRootPart") end)
+        if ok then PARRY.rootCache = root end
+    end
+    return PARRY.rootCache
+end
+
+-- the parry tick calls this per target at 120 Hz, so the read must not build a
+-- closure every time
+PARRY._dist = function(a, b) return (a.Position - b.Position).Magnitude end
+PARRY._live = function(r) return r ~= nil and r.Parent ~= nil end
+
+function PARRY.distance(a, b)
+    if not a or not b then return nil end
+    local ok, d = pcall(PARRY._dist, a, b)
+    if ok and type(d) == "number" then return d end
+    return nil
+end
+
+-- ping moves at network speed; the range check asks for it 120 times a second
+function PARRY.ping()
+    local now = os.clock()
+    if now - (PARRY.pingAt or 0) < 0.5 then return PARRY.pingVal or 0 end
+    PARRY.pingAt = now
+    PARRY.pingVal = 0
+    if type(GetPingValue) == "function" then
+        local ok, v = pcall(GetPingValue)
+        if ok and type(v) == "number" then PARRY.pingVal = v end
+    end
+    return PARRY.pingVal
+end
+
+function PARRY.range()
+    local r = CFG.ppRange or 14
+    if CFG.ppPing then r = r + PARRY.ping() * 0.015 end
+    return math.max(r, CFG.ppMinRange or 13)
+end
+
+function PARRY.dagger()
+    local ch = PARRY.myChar()
+    local pack = nil
+    if lp then pcall(function() pack = lp:FindFirstChildOfClass("Backpack") end) end
+    for _, holder in ipairs({ ch, pack }) do
+        if holder then
+            for _, name in ipairs({ "Parrying Dagger", "Parry Dagger" }) do
+                local t = nil
+                pcall(function() t = holder:FindFirstChild(name) end)
+                if t then return t end
+            end
+            local ok, kids = pcall(function() return holder:GetChildren() end)
+            if ok and kids then
+                for i = 1, #kids do
+                    local n = string.lower(tostring(kids[i].Name))
+                    if n:find("dagger", 1, true) or n:find("parry", 1, true) then
+                        return kids[i]
+                    end
+                end
+            end
+        end
+    end
+end
+
+function PARRY.equip()
+    local ch = PARRY.myChar()
+    local tool = PARRY.dagger()
+    if not ch or not tool or PARRY.same(tool.Parent, ch) then return end
+    local hum = nil
+    pcall(function() hum = ch:FindFirstChildOfClass("Humanoid") end)
+    pcall(function()
+        tool.Parent = ch
+        if hum then task.spawn(function() hum:EquipTool(tool) end) end
+    end)
+end
+
+function PARRY.facing(kRoot, myRoot)
+    local delta = PARRY.distance(kRoot, myRoot)
+    if not delta or delta < 0.05 then return true end
+    local dir = nil
+    pcall(function() dir = (myRoot.Position - kRoot.Position).Unit end)
+    if not dir then return true end
+    local look = nil
+    pcall(function() look = kRoot.CFrame.LookVector end)
+    if look and look:Dot(dir) > -0.1 then return true end
+    return false
+end
+
+-- Gates cached at 5 Hz. Each GetAttribute measured ~606us here.
+function PARRY.refreshGates()
+    local now = os.clock()
+    if now - PARRY.gate.at < 0.2 then return end
+    PARRY.gate.at = now
+    -- the skillcheck prompt owns the input while it is on screen: a parry press
+    -- there would spend the same click and lose the check
+    if CFG.sc and scGui and scGui.line ~= nil then
+        PARRY.gate.ok = false
+        PARRY.gate.reason = "skillcheck priority"
+        return
+    end
+    local ch = PARRY.myChar()
+    if not ch then PARRY.gate.ok = false PARRY.gate.reason = "no character" return end
+
+    local hum = nil
+    pcall(function() hum = ch:FindFirstChildOfClass("Humanoid") end)
+    local hmax, hp = nil, nil
+    pcall(function() hmax = hum and hum.MaxHealth end)
+    pcall(function() hp = hum and hum.Health end)
+    if type(hmax) == "number" and hmax > 0 and type(hp) == "number"
+        and hp < hmax * ((CFG.ppHealth or 50) / 100) then
+        PARRY.gate.ok = false PARRY.gate.reason = "health too low" return
+    end
+
+    for i = 1, #PARRY.blocked do
+        local v = nil
+        pcall(function() v = ch:GetAttribute(PARRY.blocked[i]) end)
+        if v == true then
+            PARRY.gate.ok = false
+            PARRY.gate.reason = "unavailable (" .. PARRY.blocked[i] .. ")"
+            return
+        end
+    end
+
+    local interact = nil
+    pcall(function() interact = ch:FindFirstChild("CheckInterractable") end)
+    if interact then
+        for i = 1, #PARRY.actions do
+            local v = nil
+            pcall(function() v = interact:GetAttribute(PARRY.actions[i]) end)
+            if v == true then PARRY.gate.ok = false PARRY.gate.reason = "waiting for action" return end
+        end
+    end
+
+    if not PARRY.dagger() then PARRY.gate.ok = false PARRY.gate.reason = "no dagger" return end
+
+    PARRY.gate.ok = true
+    PARRY.gate.reason = "ready"
+end
+
+function PARRY.press(reason, distance)
+    if not running or not CFG.pp then return false end
+    PARRY.refreshGates()
+    if not PARRY.gate.ok then
+        PARRY.state = PARRY.gate.reason
+        PARRY.denied = PARRY.gate.reason
+        return false
+    end
+
+    local now = os.clock()
+    if now - PARRY.lastPress < (CFG.ppInterval or 0.45) then
+        PARRY.denied = "press interval"
+        return false
+    end
+
+    PARRY.lastPress = now
+    PARRY.denied = nil
+    PARRY.presses = PARRY.presses + 1
+    PARRY.reason = reason
+    PARRY.state = "pressed: " .. tostring(reason)
+
+    -- Click first: the swing's lead is the budget, not a dagger re-equip.
+    pcall(function() setrobloxinput(true) end)
+    if type(mouse2click) == "function" then pcall(mouse2click) end
+
+    if CFG.ppEquip then task.spawn(PARRY.equip) end
+
+    -- The game's own "the parry connected" flag, 350 ms later.
+    task.spawn(function()
+        task.wait(0.35)
+        local ch = PARRY.myChar()
+        if not ch then return end
+        local lands = nil
+        pcall(function() lands = ch:GetAttribute("ParryLands") end)
+        if lands == 1 or lands == true then
+            PARRY.lands = PARRY.lands + 1
+            PARRY.state = "parried"
+        end
+    end)
+    return true
+end
+
+function PARRY.collect(now)
+    local fresh = {}
+    local mine = PARRY.myChar()
+    -- named readers, not pcall closures: this walks every model in the workspace
+    -- once a second, and a closure per read was an allocation per model per scan
+    local ok, kids = pcall(RT.io.children, Workspace)
+    if ok and type(kids) == "table" then
+        for i = 1, #kids do
+            local model = kids[i]
+            local okc, cls = pcall(RT.io.cls, model)
+            if okc and cls == "Model" and not PARRY.same(model, mine) then
+                local okr, root = pcall(RT.io.find, model, "HumanoidRootPart")
+                local okh, hum = pcall(RT.io.findClass, model, "Humanoid")
+                if okr and okh and root and hum then
+                    local killer = false
+                    for j = 1, #PP_KILLER_ATTRS do
+                        local okv, v = pcall(RT.io.attribute, model, PP_KILLER_ATTRS[j])
+                        if okv and v ~= nil then killer = true break end
+                    end
+                    if killer then
+                        local key = PARRY.addr(model)
+                        local t = PARRY.targets[key]
+                        if not t then
+                            t = { char = model }
+                            PARRY.targets[key] = t
+                        end
+                        t.char = model
+                        t.root = root
+                        local oki, interact = pcall(RT.io.find, model, "CheckInterractable")
+                        t.interact = oki and interact or nil
+                        fresh[key] = true
+                    end
+                end
+            end
+        end
+    end
+    for key, t in pairs(PARRY.targets) do
+        local alive = false
+        if t.char then
+            local okp, par = pcall(RT.io.parent, t.char)
+            alive = okp and par ~= nil
+        end
+        if not fresh[key] or not alive then PARRY.targets[key] = nil end
+    end
+end
+
+-- The trigger. AC_AllowedSpeed in 20..40 is the swing; the stab flag follows
+-- it by a poll and waiting for it only burns lead.
+function PARRY.windup(t, distance, myRoot)
+    local stab, allowed = nil, nil
+    pcall(function() stab = t.char:GetAttribute("LowerBodyStabilize") end)
+    pcall(function() allowed = t.char:GetAttribute("AC_AllowedSpeed") end)
+
+    local active = type(allowed) == "number" and allowed >= 20 and allowed <= 40
+    if not active then
+        t.windupFired = false
+        return
+    end
+    if CFG.ppVault then
+        for i = 1, #PARRY.vault do
+            local v = nil
+            pcall(function() v = t.char:GetAttribute(PARRY.vault[i]) end)
+            if v == true then
+                t.windupFired = false
+                PARRY.denied = "killer vaulting"
+                return
+            end
+        end
+    end
+    if t.windupFired then return end
+    if distance > PARRY.range() then return end
+    if CFG.ppFacing and t.root and myRoot and not PARRY.facing(t.root, myRoot) then return end
+
+    t.windupFired = true
+    if CFG.ppAim and t.root then
+        task.spawn(function()
+            local cam = nil
+            pcall(function() cam = Workspace.CurrentCamera end)
+            if not cam then return end
+            local pos, target = nil, nil
+            pcall(function() pos = cam.CFrame.Position end)
+            pcall(function() target = t.root.Position end)
+            if pos and target then pcall(function() cam.CFrame = CFrame.new(pos, target) end) end
+        end)
+    end
+    PARRY.press("windup", distance)
+end
+
+function PARRY.step()
+    if not CFG.pp then PARRY.state = "Disabled" return end
+    local now = os.clock()
+    if now >= PARRY.lastCollect + 1 then
+        PARRY.lastCollect = now
+        PARRY.collect(now)
+    end
+
+    -- keep the status honest even when no swing is happening
+    pcall(PARRY.refreshGates)
+
+    local windupDue = CFG.ppWindup and now >= PARRY.lastWindup + 1 / (CFG.ppWindupHz or 120)
+    if windupDue then PARRY.lastWindup = now end
+
+    local myRoot = PARRY.myRoot()
+    local hadPress = PARRY.presses
+    for _, t in pairs(PARRY.targets) do
+        local okLive, live = pcall(PARRY._live, t.root)
+        if okLive and live and myRoot then
+            local distance = PARRY.distance(t.root, myRoot)
+            if distance and distance <= (CFG.ppScanRange or 70) then
+                PARRY.scans = PARRY.scans + 1
+                if windupDue then
+                    local ok, err = pcall(PARRY.windup, t, distance, myRoot)
+                    if not ok then PARRY.error = tostring(err) end
+                end
+            end
+        end
+    end
+
+    if PARRY.presses == hadPress and PARRY.state ~= "parried" then
+        if not myRoot then
+            PARRY.state = "waiting for character"
+        elseif PARRY.gate.ok or PARRY.denied == nil then
+            PARRY.state = "watching"
+        else
+            PARRY.state = PARRY.denied or "watching"
+        end
+    end
+end
+
+task.spawn(function()
+    while running do
+        if CFG.pp then
+            local ok, err = pcall(PARRY.step)
+            if not ok then
+                PARRY.state = "read error"
+                PARRY.error = tostring(err)
+            end
+        end
+        task.wait(CFG.pp and (1 / (CFG.ppHz or 120)) or 0.1)
+    end
+end)
+
+task.spawn(function()
+    while running do
+        if CFG.pp and CFG.ppEquip then
+            local myRoot = PARRY.myRoot()
+            if myRoot then
+                for _, t in pairs(PARRY.targets) do
+                    local d = PARRY.distance(t.root, myRoot)
+                    if d and d <= (CFG.ppEquipRange or 45) then
+                        PARRY.equip()
+                        break
+                    end
+                end
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+function API.ParryStatus()
+    local n = 0
+    for _ in pairs(PARRY.targets) do n = n + 1 end
+    return {
+        enabled = CFG.pp, state = PARRY.state, presses = PARRY.presses,
+        lands = PARRY.lands, scans = PARRY.scans, targets = n,
+        denied = PARRY.denied, reason = PARRY.reason, error = PARRY.error,
+        gate = PARRY.gate.reason,
+    }
+end
+function API.SetParry(on)
+    CFG.pp = on and true or false
+    if not CFG.pp then PARRY.state = "Disabled" end
+    return CFG.pp
+end
 
 -- measured content height per tab, plus the window height and how much of
 -- the active tab is scrolled away. Used to check the layout fits.
@@ -8113,6 +8663,9 @@ local function buildUI()
     local statusGroup = mainTab:AddGroupbox({ Side = "Right", Name = "Status" })
     local statusLabel = statusGroup:AddLabel({ Text = "starting...", DoesWrap = true })
     local statsLabel = statusGroup:AddLabel({ Text = "checks 0  hits 0  misses 0", DoesWrap = true })
+    statusGroup:AddDivider("Parry")
+    local ppStateLabel = statusGroup:AddLabel({ Text = "parry: --", DoesWrap = true })
+    local ppStatsLabel = statusGroup:AddLabel({ Text = "presses 0", DoesWrap = true })
     statusGroup:AddDivider("Session")
     statusGroup:AddLabel({ Text = "Credit: UI is Swangy by aphalia (github.com/YoungSlaves/matchaUI).", DoesWrap = true })
     statusGroup:AddDivider("Keys")
@@ -8128,6 +8681,13 @@ local function buildUI()
             if statsLabel then
                 statsLabel:SetText(string.format("checks %d  hits %d  misses %d  errors %d",
                     scStats.checks, scStats.hits, scStats.misses, scStats.errors))
+            end
+            if ppStateLabel then
+                ppStateLabel:SetText("parry: " .. tostring(PARRY.state or "--"))
+            end
+            if ppStatsLabel then
+                ppStatsLabel:SetText(string.format("presses %d  parried %d  %s",
+                    PARRY.presses, PARRY.lands, tostring(PARRY.denied or PARRY.gate.reason or "--")))
             end
             task.wait(0.25)
         end
@@ -8231,6 +8791,40 @@ local function buildUI()
     })
     aimGroup:AddLabel({
         Text = "Click the key box to bind. Right-click it for Hold / Toggle / Always. Escape clears it.",
+        DoesWrap = true,
+    })
+
+    local ppGroup = mainTab:AddGroupbox({ Side = "Left", Name = "Auto Parry", Description = "windup-attribute parry, mouse2click" })
+    local ppToggle = ppGroup:AddToggle("pp_enabled", {
+        Text = "Auto parry",
+        Default = CFG.pp,
+        Callback = function(on)
+            CFG.pp = on and true or false
+            if not CFG.pp then PARRY.state = "Disabled" end
+            if UI then UI:Notify("Auto parry  [ " .. (CFG.pp and "ON" or "OFF") .. " ]", 2, "Swangy") end
+        end,
+    })
+    ppToggle:AddKeyPicker("pp_key", { Text = "Parry key", Mode = "Always" })
+    ppGroup:AddSlider("pp_range", {
+        Text = "Range", Default = CFG.ppRange,
+        Min = 4, Max = 25, Rounding = 1, Suffix = " studs",
+        Callback = function(v) CFG.ppRange = v end,
+    })
+    ppGroup:AddSlider("pp_health", {
+        Text = "Minimum health", Default = CFG.ppHealth,
+        Min = 10, Max = 100, Rounding = 5, Suffix = "%",
+        Callback = function(v) CFG.ppHealth = v end,
+    })
+    ppGroup:AddToggle("pp_windup", {
+        Text = "Windup fallback", Default = CFG.ppWindup,
+        Callback = function(on) CFG.ppWindup = on and true or false end,
+    })
+    ppGroup:AddToggle("pp_equip", {
+        Text = "Auto equip dagger", Default = CFG.ppEquip,
+        Callback = function(on) CFG.ppEquip = on and true or false end,
+    })
+    ppGroup:AddLabel({
+        Text = "Key box: click to bind, right-click for Hold / Toggle / Always, Escape clears.",
         DoesWrap = true,
     })
 
