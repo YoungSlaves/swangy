@@ -8552,7 +8552,7 @@ end
 
 --============================================================== matcha menu
 -- Second build: the settings live in Matcha's own menu instead of the embedded
--- Drawing window. The renderer, HUD, skillcheck, aim and parry are unchanged;
+-- Drawing window. The renderer, HUD, skillcheck and aim are unchanged;
 -- only the settings surface and its keybinds differ.
 local function buildMatchaUI()
     local M = _G.UI
@@ -8565,8 +8565,6 @@ local function buildMatchaUI()
         sw_range = CFG.espRange,
         sc_on = CFG.sc, sc_hum = CFG.scHum, sc_hum_min = CFG.scHumMin, sc_hum_max = CFG.scHumMax,
         sc_react = CFG.scReact, sc_delay = CFG.scDelay,
-        pp_on = CFG.pp, pp_range = CFG.ppRange, pp_health = CFG.ppHealth,
-        pp_windup = CFG.ppWindup, pp_equip = CFG.ppEquip,
         va_on = CFG.va, va_fov = CFG.vaFov, va_range = CFG.vaRange, va_smooth = CFG.vaSmooth,
         va_height = CFG.vaAimHeight, va_sticky = CFG.vaSticky, va_lead = CFG.vaLead,
         va_los = CFG.vaLos, va_hold = CFG.vaHold,
@@ -8586,7 +8584,7 @@ local function buildMatchaUI()
     local kbState = {}
     local kbTick = 0
     local KB_BY_TOGGLE = {
-        sc_on = "sc_kb", pp_on = "pp_kb", va_on = "va_kb",
+        sc_on = "sc_kb", va_on = "va_kb",
         hud_on = "hud_kb", sw_all = "sw_all_kb",
     }
 
@@ -8638,11 +8636,6 @@ local function buildMatchaUI()
         end,
         sc_react = function(v) CFG.scReact = math.clamp(tonumber(v) or 0, 0, 300) end,
         sc_delay = function(v) CFG.scDelay = math.clamp(tonumber(v) or 0, 0, 300) end,
-        pp_on = function(v) API.SetParry(v == true) end,
-        pp_range = function(v) CFG.ppRange = math.clamp(tonumber(v) or 14, 4, 25) end,
-        pp_health = function(v) CFG.ppHealth = math.clamp(tonumber(v) or 50, 10, 100) end,
-        pp_windup = function(v) CFG.ppWindup = v == true end,
-        pp_equip = function(v) CFG.ppEquip = v == true end,
         va_on = function(v) API.va.SetEnabled(v == true) end,
         va_fov = function(v) CFG.vaFov = math.clamp(tonumber(v) or 55, 5, 180) end,
         va_range = function(v) CFG.vaRange = math.clamp(tonumber(v) or 260, 20, 600) end,
@@ -8813,13 +8806,6 @@ local function buildMatchaUI()
         W(k, "SliderInt", "sc_react", "Reaction ms", 0, 300, D.sc_react)
         W(k, "SliderInt", "sc_delay", "Delay before click ms", 0, 300, D.sc_delay)
 
-        local p = tab:Section("Auto Parry", "Right")
-        W(p, "Toggle", "pp_on", "Auto parry", D.pp_on)
-        kb(p, "pp_kb", 0x70, "toggle", "Auto parry", "pp_on")
-        W(p, "SliderInt", "pp_range", "Range", 4, 25, D.pp_range)
-        W(p, "SliderInt", "pp_health", "Minimum health %", 10, 100, D.pp_health)
-        W(p, "Toggle", "pp_windup", "Windup fallback", D.pp_windup)
-        W(p, "Toggle", "pp_equip", "Auto equip dagger", D.pp_equip)
 
         local h = tab:Section("Hotkeys", "Right")
         W(h, "Text", "Rebind any key from the widget after its toggle.")
@@ -8964,7 +8950,6 @@ local function buildMatchaUI()
     -- so the switch in the menu always says what the key just did.
     local KEYS = {
         { kb = "sc_kb",     toggle = "sc_on"  },
-        { kb = "pp_kb",     toggle = "pp_on"  },
         { kb = "va_kb",     toggle = "va_on"  },
         { kb = "hud_kb",    toggle = "hud_on" },
         { kb = "sw_all_kb", toggle = "sw_all" },
