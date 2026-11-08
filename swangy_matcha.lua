@@ -131,8 +131,8 @@ local CFG = {
     genText   = 13,
     genState  = true,
     genFill   = true,
-    genFillA  = 0.25,
-    genThick  = 1.6,
+    genFillA  = 0.35,
+    genThick  = 1.5,
     genIdleColour   = Color3.fromRGB(26, 255, 51),
     genDoneColour   = Color3.fromRGB(51, 255, 77),
     genBrokenColour = Color3.fromRGB(255, 120, 120),
@@ -142,8 +142,8 @@ local CFG = {
     winPool   = 32,
     winText   = 12,
     winFill   = true,
-    winFillA  = 0.20,
-    winThick  = 1.6,
+    winFillA  = 0.35,
+    winThick  = 1.5,
     winColour = Color3.fromRGB(255, 230, 0),
 
     pal       = true,
@@ -151,8 +151,8 @@ local CFG = {
     palPool   = 20,
     palText   = 12,
     palFill   = true,
-    palFillA  = 0.20,
-    palThick  = 1.6,
+    palFillA  = 0.35,
+    palThick  = 1.5,
     palColour     = Color3.fromRGB(255, 26, 26),
     palDownColour = Color3.fromRGB(255, 140, 26),
 
@@ -161,8 +161,8 @@ local CFG = {
     trapPool      = 12,
     trapText      = 12,
     trapFill      = true,
-    trapFillA     = 0.20,
-    trapThick     = 1.6,
+    trapFillA     = 0.35,
+    trapThick     = 1.5,
     trapArmedColour  = Color3.fromRGB(80, 255, 120),
     trapSprungColour = Color3.fromRGB(255, 60, 60),
 
@@ -550,39 +550,60 @@ local function drawBox(e, center, hx, hy, hz, right, up, back, colour, fillAlpha
             end
         end
     end
+    -- WorldToScreen answers "invisible" for every corner it cannot see, and
+    -- dropping those corners is what let a box dissolve into two or three stray
+    -- edges the moment one end left the viewport. The reference projects those
+    -- corners itself off the camera basis instead, so a box that is in front of
+    -- the camera always has eight points and a closed outline.
+    local focal
+    if CAM.tanV and camVpH and camVpH > 0 then focal = (camVpH * 0.5) / CAM.tanV end
     for i = 1, 8 do
         local c = CORNER[i]
         local ax, ay, az = c[1] * hx, c[2] * hy, c[3] * hz
-        local sp, onScreen = WorldToScreen(Vector3.new(
-            cx + rX * ax + uX * ay + bX * az,
-            cy + rY * ax + uY * ay + bY * az,
-            cz + rZ * ax + uZ * ay + bZ * az))
+        local wx = cx + rX * ax + uX * ay + bX * az
+        local wy = cy + rY * ax + uY * ay + bY * az
+        local wz = cz + rZ * ax + uZ * ay + bZ * az
+        local sp, onScreen = WorldToScreen(Vector3.new(wx, wy, wz))
+        local sx, sy
         if onScreen and sp then
-            local sx, sy = sp.X, sp.Y
-            -- a corner projected through the camera plane can come back as nan or
-            -- an absurd number; a nan vertex is what kills renderers, not the box
-            -- py has to be cleared with px: the label bounds below are read
-            -- from py, and a y left behind by a corner that has since left
-            -- the screen puts the label in the wrong place
-            if sx ~= sx or sy ~= sy or math.abs(sx) > 1e7 or math.abs(sy) > 1e7 then
-                px[i], py[i] = nil, nil
-            else
-                px[i], py[i] = sx, sy
-                hn = hn + 1
-                hX[hn], hY[hn] = sx, sy
-                anyFront, frontN = true, frontN + 1
-                if sx < minX then minX = sx end
-                if sx > maxX then maxX = sx end
-                if sy < minY then minY = sy end
-                if sy > maxY then maxY = sy end
+            sx, sy = sp.X, sp.Y
+        elseif focal then
+            local dx, dy, dz = wx - CAM.x, wy - CAM.y, wz - CAM.z
+            local depth = dx * CAM.lx + dy * CAM.ly + dz * CAM.lz
+            if depth > 0.1 then
+                local scale = focal / depth
+                sx = camVpW * 0.5 + (dx * CAM.rx + dy * CAM.ry + dz * CAM.rz) * scale
+                sy = camVpH * 0.5 - (dx * CAM.ux + dy * CAM.uy + dz * CAM.uz) * scale
             end
+        end
+        -- a corner projected through the camera plane can come back as nan or an
+        -- absurd number; a nan vertex is what kills renderers, not the box.
+        -- py has to be cleared with px: the label bounds below are read from py,
+        -- and a y left behind by a corner that has since left the screen puts
+        -- the label in the wrong place.
+        if sx and sy and sx == sx and sy == sy
+            and math.abs(sx) <= 1e7 and math.abs(sy) <= 1e7 then
+            px[i], py[i] = sx, sy
+            hn = hn + 1
+            hX[hn], hY[hn] = sx, sy
+            anyFront = true
+            if onScreen then frontN = frontN + 1 end
+            if sx < minX then minX = sx end
+            if sx > maxX then maxX = sx end
+            if sy < minY then minY = sy end
+            if sy > maxY then maxY = sy end
         else
             px[i], py[i] = nil, nil
         end
     end
     if not anyFront then
-        hideSlot(e)
-        return nil
+        -- no corner is inside the viewport, but a box you are standing next to
+        -- can still cover half the screen. Keep it while the projected hull
+        -- touches the viewport, drop it once it is entirely outside.
+        if hn < 3 or maxX < 0 or minX > camVpW or maxY < 0 or minY > camVpH then
+            hideSlot(e)
+            return nil
+        end
     end
 
     if camNow then
@@ -636,7 +657,10 @@ local function drawBox(e, center, hx, hy, hz, right, up, back, colour, fillAlpha
         end
     end
 
-    if fillAlpha and frontN == 8 and (botY - topY) >= 26 then
+    -- the reference fills whenever the hull has three points, and so does this:
+    -- waiting for all eight corners left a hole in every box that straddled the
+    -- screen edge, which is most of them at a 1000 stud range
+    if fillAlpha and hn >= 3 then
         fillHull(e, hn, colour, fillAlpha)
     elseif e.tris[1].Visible then
         for i = 1, 6 do e.tris[i].Visible = false end
@@ -1042,9 +1066,14 @@ local function collectWindows()
     if not okAll or type(desc) ~= "table" then return nil end
 
     local candidates = {}
+    -- the reference walks this same list with a yield every 500 entries, and that
+    -- is the whole difference between a long freeze and a slow frame: without it
+    -- this loop owns the VM until the last descendant has been read through
+    -- interop, and nothing else -- the overlay, the menu, the input loop -- runs.
     for i = 1, #desc do
+        if i % 500 == 0 then task.wait() end
         local inst = desc[i]
-        local okc, nm = pcall(function() return inst.Name end)
+        local okc, nm = pcall(RT.io.name, inst)
         if okc and nm and lower(nm):find("window", 1, true) then
             if isPart(inst) then candidates[#candidates + 1] = inst end
             local okKids, kids = pcall(RT.io.descendants, inst)
@@ -1060,7 +1089,8 @@ local function collectWindows()
     -- the external keys off the part literally named "Bottom"
     local anyBottom = false
     for i = 1, #candidates do
-        local okn, nm = pcall(function() return candidates[i].Name end)
+        if i % 32 == 0 then task.wait() end
+        local okn, nm = pcall(RT.io.name, candidates[i])
         if okn and nm and lower(nm) == "bottom" then anyBottom = true break end
     end
 
@@ -1089,8 +1119,9 @@ local function collectWindows()
 
     local out = {}
     for i = 1, #candidates do
+        if i % 32 == 0 then task.wait() end
         local k = candidates[i]
-        local okn, nm = pcall(function() return k.Name end)
+        local okn, nm = pcall(RT.io.name, k)
         if (not anyBottom) or (okn and nm and lower(nm) == "bottom") then
             local e = entryFor(k)
             -- same sanity limits as the reference: a zero-sized or absurd part
@@ -2328,15 +2359,29 @@ local function refreshWorld()
             winScanStamp = stamp
             winGeo = {}
             winScanAt = 0
+            RT.winStable, RT.winCount = 0, nil
         end
         -- one full pass a second, like the reference: cheap enough in the poll
         -- loop, and a window is never missed because it streamed in late
         if t >= winScanAt then
-            winScanAt = t + 1
             local found = collectWindows()
             if found then
-                ensureSlots(winPool, math.min(#found, CFG.winPool), CFG.winThick, CFG.winText)
+                local n = #found
+                -- the reference stops scanning windows once the set stops moving.
+                -- Three equal passes in a row hold at one every ten seconds; any
+                -- change drops straight back to one a second, so a window that
+                -- streams in late is still picked up within a second.
+                if n >= 3 and n == (RT.winCount or -1) then
+                    RT.winStable = (RT.winStable or 0) + 1
+                else
+                    RT.winStable = 0
+                end
+                RT.winCount = n
+                winScanAt = t + ((RT.winStable or 0) >= 3 and 10 or 1)
+                ensureSlots(winPool, math.min(n, CFG.winPool), CFG.winThick, CFG.winText)
                 winList = found
+            else
+                winScanAt = t + 1
             end
         end
     end
@@ -9091,6 +9136,7 @@ local function buildMatchaUI()
 end
 
 -- boot
+RT.bootAt = os.clock()
 local okM, resM = pcall(buildMatchaUI)
 if not okM or resM == false then
     if not okM and type(warn) == "function" then
@@ -9103,7 +9149,9 @@ if not okM or resM == false then
 end
 API.ui = UI
 RT.safe()
-pcall(print, "[swangy] ui up: " .. tostring(type(UI) == "table" and "ok" or "none"))
+pcall(print, string.format("[swangy] ui up: %s in %.1fs (the exec call returns after this)",
+    tostring(type(UI) == "table" and "ok" or "none"),
+    os.clock() - (RT.bootAt or os.clock())))
 
 -- the first scan used to run inside the exec call itself, which on a full map is
 -- the one place the loader could block long enough to look like a crash
@@ -9111,10 +9159,11 @@ task.spawn(function()
     task.wait(0.8)
     while running and not RT.isLoaded() do task.wait(0.5) end
     if not running then return end
+    local scanAt = os.clock()
     local okw, errw = pcall(refreshWorld)
     local okp, errp = pcall(refreshPallets)
-    pcall(print, string.format("[swangy] first scan: gen=%d win=%d pal=%d trap=%d drawings=%d%s%s",
-        #genList, #winList, #palList, #trapList, RT.draw,
+    pcall(print, string.format("[swangy] first scan: gen=%d win=%d pal=%d trap=%d drawings=%d in %.1fs%s%s",
+        #genList, #winList, #palList, #trapList, RT.draw, os.clock() - scanAt,
         okw and "" or (" world=" .. tostring(errw)),
         okp and "" or (" pal=" .. tostring(errp))))
 end)
